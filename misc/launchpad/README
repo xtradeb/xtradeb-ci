@@ -1,0 +1,5 @@
+copy-package and lputils.py are taken from
+	https://git.launchpad.net/ubuntu-archive-tools
+
+ubuntu-build is taken and modified from
+	https://git.launchpad.net/ubuntu-dev-tools

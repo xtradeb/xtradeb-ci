@@ -1,0 +1,145 @@
+---
+name: Launchpad action
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        type: string
+      ppa:
+        type: string
+      package:
+        type: string
+      orig-release:
+        type: string
+        required: false
+      dest-release:
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        options: [retry, copy]
+        default: retry
+        description: Action to perform
+      ppa:
+        type: choice
+        options: [apps, play, deps, test]
+        default: apps
+        description: In XtraDeb PPA
+      package:
+        type: string
+        description: For (source) package(s)
+      orig-release:
+        type: string
+        description: "[copy] Original/from release"
+      dest-release:
+        type: string
+        description: "[copy] Destination/to release(s)"
+
+run-name: "${{inputs.action}}: ${{inputs.package}}"
+
+jobs:
+
+  action:
+    runs-on: ubuntu-slim
+    env:
+      ARG_ACTION: ${{inputs.action}}
+      ARG_PPA: ${{inputs.ppa}}
+      ARG_PACKAGE: ${{inputs.package}}
+      ARG_ORIG_RELEASE: ${{inputs.orig-release}}
+      ARG_DEST_RELEASE: ${{inputs.dest-release}}
+      # Warning: May contain CRs
+      CODENAME_LIST: ${{vars.UBUNTU_CODENAME_LIST}}
+    steps:
+
+      - name: Validate workflow arguments
+        run: |
+          exec 2>&1
+          perl -T -C0 \
+            -e '$| = 1; $c = qr/[a-z]{2,12}/; $p = qr/[0-9a-z][-0-9a-z.]{1,64}/; $s = qr/ {1,2}/;' \
+            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^$r$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
+            -e 'chk("ARG_ACTION", qr/(copy|retry)/, "action");' \
+            -e 'chk("ARG_PPA", qr/(no-upload|apps|play|deps|test)/, "PPA");' \
+            -e 'chk("ARG_PACKAGE", qr/$p($s$p)*/, "package(s)");' \
+            -e 'chk("ARG_PACKAGE", qr/.{,128}/, "package(s)");' \
+            -e 'chk("ARG_ORIG_RELEASE", qr/((primary-)?$c)?/, "source release");' \
+            -e 'chk("ARG_DEST_RELEASE", qr/($c($s$c)*)?/, "destination release(s)");' \
+            -e 'chk("ARG_DEST_RELEASE", qr/.{,64}/, "destination release(s)");'
+          cn_list=$(tr -d '\r' <<< $CODENAME_LIST)
+          ! for cn in $ARG_ORIG_RELEASE $ARG_DEST_RELEASE
+          do
+            grep -Fqw "$cn" <<< $cn_list \
+            || echo "error: \"$cn\" is not in UBUNTU_CODENAME_LIST"
+          done | grep .
+          echo ' '; echo 'Validated arguments:'
+          env | awk -v FS== '/^ARG_/ {print $1 ": " $2 }' | sort
+
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Install required packages
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          # Note: https://github.com/actions/runner-images/issues/13426
+          apt_get_install \
+            python3-launchpadlib \
+            python3-ubuntutools
+
+      - name: Perform action
+        env:
+          LP_CREDENTIALS: ${{secrets.LP_CREDENTIALS}}
+          LP_CREDENTIALS_FILE: /tmp/lpcreds
+        run: |
+          exec 2>&1
+          (umask 077; echo "$LP_CREDENTIALS" > $LP_CREDENTIALS_FILE)
+          unset LP_CREDENTIALS
+          ! grep -Pq '\r' $LP_CREDENTIALS_FILE
+          case $ARG_ACTION in
+            copy)
+            case "$ARG_ORIG_RELEASE" in
+              primary-*)
+              copy_from=ubuntu
+              copy_from_suite=${ARG_ORIG_RELEASE#primary-}
+              ;;
+              *)
+              copy_from=ppa:xtradeb/ubuntu/$ARG_PPA
+              copy_from_suite=$ARG_ORIG_RELEASE
+              ;;
+            esac
+            for package in $ARG_PACKAGE
+            do
+              for release in $ARG_DEST_RELEASE
+              do
+                echo ' '
+                (set -x; misc/launchpad/copy-package \
+                  --confirm-all \
+                  --include-binaries \
+                  --from=$copy_from \
+                  --from-suite=$copy_from_suite \
+                  --to=ppa:xtradeb/ubuntu/$ARG_PPA \
+                  --to-suite=$release \
+                  $package)
+              done
+            done
+            ;;
+            retry)
+            for package in $ARG_PACKAGE
+            do
+              for codename in $(tr -d '\r' <<< $CODENAME_LIST)
+              do
+                echo ' '
+                (set -x; misc/launchpad/ubuntu-build \
+                  -A ppa:xtradeb/ubuntu/$ARG_PPA \
+                  $package \
+                  $codename \
+                  retry-soft-failed)
+              done
+            done
+            ;;
+          esac
+          rm $LP_CREDENTIALS_FILE
+
+# end lp-action.yml

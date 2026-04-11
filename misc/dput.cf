@@ -1,0 +1,26 @@
+# dput.cf
+
+# Note: This config requires the dput-ng + python3-paramiko packages,
+# not the original "dput" which does not support the sftp method.
+
+[DEFAULT]
+fqdn = ppa.launchpad.net
+method = sftp
+login = xtradeb-bot
+allow_unsigned_uploads = 1
+
+# https://launchpad.net/~xtradeb
+
+[xtradeb-apps]
+incoming = ~xtradeb/ubuntu/apps/
+
+[xtradeb-play]
+incoming = ~xtradeb/ubuntu/play/
+
+[xtradeb-deps]
+incoming = ~xtradeb/ubuntu/deps/
+
+[xtradeb-test]
+incoming = ~xtradeb/ubuntu/test/
+
+# end dput.cf

@@ -1,0 +1,860 @@
+---
+name: XtraDeb package CI
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        type: string
+      max-time:
+        type: number
+        default: 30
+      ppa:
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      source:
+        type: string
+        description: URL of input package .dsc file
+      max-time:
+        type: number
+        description: Maximum test build duration (minutes)
+        default: 30
+      ppa:
+        type: choice
+        options: [no-upload, apps, play, deps, test]
+        default: no-upload
+        description: Upload to this XtraDeb PPA
+      source-hash:
+        type: string
+        description: "\U0001F527 Hash (digest) of source .dsc file"
+        required: false
+      subset-release:
+        type: string
+        description: "\U0001F527 Subset of releases to target"
+        # ...specified as a space-separated list of codenames
+        required: false
+      xd-convert-rev:
+        type: string
+        description: "\U0001F527 Git revision of xtradeb-convert"
+        required: false
+      xd-version-major:
+        type: number
+        description: "\U0001F527 XtraDeb version major"
+        required: false
+      xd-version-minor:
+        type: number
+        description: "\U0001F527 XtraDeb version minor"
+        required: false
+      include-source:
+        type: choice
+        options: ['auto', 'yes', 'no']
+        default: auto
+        description: "\U0001F527 Include source in first upload?"
+        required: false
+      run-name:
+        # Workaround to the inability to change the title of the workflow
+        # run after it has started (i.e. to set it to a computed value; see
+        # https://github.com/orgs/community/discussions/69476)
+        type: string
+        description: "\U0001F527 Workflow run title"
+        required: false
+
+run-name: ${{inputs.run-name || github.workflow}}
+
+env:
+  MAIN_UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+  ALT_UBUNTU_MIRROR: http://mirror.pit.teraswitch.com/ubuntu
+  DEBIAN_MIRROR: http://debian-archive.trafficmanager.net/debian
+  DEBFULLNAME: ${{vars.DEBFULLNAME}}
+  DEBEMAIL: ${{vars.DEBEMAIL}}
+
+jobs:
+
+  prep-source:
+    runs-on: ubuntu-24.04
+    env:
+      ARG_SOURCE: ${{inputs.source}}
+      ARG_MAX_TIME: ${{inputs.max-time}}
+      ARG_PPA: ${{inputs.ppa}}
+      ARG_SOURCE_HASH: ${{inputs.source-hash}}
+      ARG_SUBSET_RELEASE: ${{inputs.subset-release}}
+      ARG_XD_CONVERT_REV: ${{inputs.xd-convert-rev}}
+      ARG_XD_VERSION_MAJOR: ${{inputs.xd-version-major}}
+      ARG_XD_VERSION_MINOR: ${{inputs.xd-version-minor}}
+      ARG_INCLUDE_SOURCE: ${{inputs.include-source}}
+      # Warning: May contain CRs
+      CODENAME_LIST: ${{vars.UBUNTU_CODENAME_LIST}}
+    outputs:
+      purge-needed: ${{steps.download-dsc.outputs.purge-needed}}
+      test-matrix: ${{steps.convert.outputs.test-matrix}}
+      ubuntu-mirror: ${{steps.mirror.outputs.ubuntu-mirror}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v6
+
+      - name: Validate workflow arguments
+        run: |
+          exec 2>&1
+          echo 'First pass:'
+          perl -T -C0 \
+            -e '$| = 1;' \
+            -e 'foreach my $var (sort(keys(%ENV))) {' \
+            -e '  $var =~ /^ARG_/ or next;' \
+            -e '  $var ne "ARG_SUBSET_RELEASE" or next;' \
+            -e '  print("$var: ");' \
+            -e '  $ENV{$var} =~ m!^(\w[-+./:~\w]{,255})?$! or die "FAILED\n";' \
+            -e '  $ENV{$var} !~ /^\s|\s$|\.\./ or die "FAILED\n";' \
+            -e '  print("OK\n");' \
+            -e '}'
+          echo ' '; echo 'Second pass:'
+          perl -T -C0 \
+            -e '$| = 1; $c = qr/[a-z]{2,12}/; $s = qr/ {1,2}/; $ver = qr/[1-9]\d?/;' \
+            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^$r$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
+            -e 'chk("ARG_MAX_TIME", qr/\d{1,4}/, "max time");' \
+            -e 'chk("ARG_PPA", qr/(no-upload|apps|play|deps|test)/, "PPA");' \
+            -e 'chk("ARG_SOURCE_HASH", qr/(sha256:[0-9a-f]{64})?/, "source hash");' \
+            -e 'chk("ARG_SUBSET_RELEASE", qr/($c($s$c)*|NO_VERSION_CHECK)?/, "subset of releases");' \
+            -e 'chk("ARG_SUBSET_RELEASE", qr/.{,64}/, "subset of releases");' \
+            -e 'chk("ARG_XD_VERSION_MAJOR", qr/($ver)?/, "version major");' \
+            -e 'chk("ARG_XD_VERSION_MINOR", qr/($ver)?/, "version minor");' \
+            -e 'chk("ARG_INCLUDE_SOURCE", qr/(auto|yes|no)/, "include-source arg");' \
+            -e 'chk("DEBEMAIL", qr/\w[^\t\n\r]*\w/, "contact e-mail");' \
+            -e 'chk("DEBFULLNAME", qr/\w[^\t\n\r]*\w/, "contact name");'
+          case "$ARG_SOURCE" in
+            $MAIN_UBUNTU_MIRROR/*/*.dsc) ;;
+            $DEBIAN_MIRROR/*/*.dsc) ;;
+            https://deb.debian.org/debian/*/*.dsc) ;;
+            https://incoming.debian.org/debian-buildd/*/.dsc) ;;
+            https://mirrors.wikimedia.org/debian/*/*.dsc) ;;
+            https://mirrors.wikimedia.org/ubuntu/*/*.dsc) ;;
+            https://launchpad.net/*/*.dsc) ;;
+            https://ppa.launchpadcontent.net/*/*.dsc) ;;
+            https://salsa.debian.org/*/-/jobs/*/artifacts/raw/debian/output/*.dsc) ;;
+            https://salsa.debian.org/xtradeb-team/*.git) ;;
+            https://salsa.debian.org/iskunk/*.git) ;;
+            https://salsa.debian.org/joliveira/*.git) ;;
+            *) echo "error: not an allowed source URL: $ARG_SOURCE"; exit 1 ;;
+          esac
+          cn_list=$(tr -d '\r' <<< $CODENAME_LIST)
+          if [ "_$ARG_SUBSET_RELEASE" != _NO_VERSION_CHECK ]
+          then
+            ! for cn in $ARG_SUBSET_RELEASE
+            do
+              grep -Fqw "$cn" <<< $cn_list \
+              || echo "error: \"$cn\" is not in UBUNTU_CODENAME_LIST"
+            done | grep .
+          fi
+          echo ' '; echo 'Validated arguments:'
+          env | awk -v FS== '/^ARG_/ {print $1 ": " $2 }' | sort
+
+      - name: Examine source URL
+        id: info
+        run: |
+          exec 2>&1
+          case "$ARG_SOURCE" in
+            *.dsc) ################
+            source_type=dsc
+            dsc_file=${ARG_SOURCE##*/}
+            echo "DSC file: $dsc_file"
+            # Note: .dsc filename must have package + version info
+            package=${dsc_file%%_*}
+            version=${dsc_file##*_}; version=${version%.dsc}
+            upstream_version=${version%-*}
+            cache_key=orig_${package}_$upstream_version
+            cat >> $GITHUB_STEP_SUMMARY << END
+          DSC file: [link]($ARG_SOURCE)
+          Package: \`$package\`
+          Version: \`$version\`
+          END
+            ;;
+            *.git) ################
+            source_type=git
+            dch=/tmp/git-changelog.txt
+            for branch in debian/latest main
+            do
+              # GitLab URL format
+              changelog_url=${ARG_SOURCE%.git}/-/raw/$branch/debian/changelog
+              wget -nv -O $dch $changelog_url && break || true
+            done
+            test -f $dch
+            package=$(dpkg-parsechangelog -l $dch -S Source)
+            version=$(dpkg-parsechangelog -l $dch -S Version)
+            upstream_version=${version%-*}
+            cache_key=git_${package}_$version
+            cat >> $GITHUB_STEP_SUMMARY << END
+          Git package repo: [link]($ARG_SOURCE)
+          Package: \`$package\`
+          Version: \`$version\`
+          END
+            ;;
+          esac
+          echo >> $GITHUB_STEP_SUMMARY
+          cat << END
+          Package: $package
+          Version (package): $version
+          Version (upstream): $upstream_version
+          Cache key: $cache_key
+          END
+          cat >> $GITHUB_OUTPUT << END
+          source-type=$source_type
+          package=$package
+          version=$version
+          upstream-version=$upstream_version
+          cache-key=$cache_key
+          END
+
+      # Avoid delays from needrestart + PHP, i.e.
+      #
+      #   Restarting services...
+      #    /etc/needrestart/restart.d/systemd-manager
+      #    systemctl restart php8.3-fpm.service
+      #
+      # after installing packages.
+      - name: Avoid delay from php*-fpm
+        run: |
+          if ! echo /usr/lib/systemd/system/php*-fpm.service | grep -Fq '*'
+          then
+            (set -x; sudo apt-get --purge remove 'php*-fpm')
+          fi
+
+      - name: Check the APT mirror server
+        id: mirror
+        run: |
+          mirror=$MAIN_UBUNTU_MIRROR
+          grep -Fq $mirror /etc/apt/apt-mirrors.txt || { echo assert failed; exit 1; }
+          mkdir /tmp/mirror-check; cd /tmp/mirror-check
+          if (set -x; timeout -v 5s apt-get download hedgewars-data)
+          then
+            # Should download at ~80 MB/sec
+            echo 'Azure Ubuntu mirror server seems OK.'
+          else
+            # *groan* https://github.com/actions/runner-images/issues/7048
+            (set -x; ls -l)
+            echo 'Using alternate Ubuntu mirror server.'
+            mirror=$ALT_UBUNTU_MIRROR
+            sudo sed -ri "s!^(URIs): .*!\\1: $mirror!" /etc/apt/sources.list.d/ubuntu.sources
+            sudo rm /etc/apt/apt-mirrors.txt
+          fi
+          cd ..; rm -r mirror-check
+          echo ubuntu-mirror=$mirror >> $GITHUB_OUTPUT
+
+      - name: Install required packages
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          apt_get_install \
+            apparmor-profiles \
+            bubblewrap \
+            cdbs \
+            debian-archive-keyring \
+            devscripts \
+            git-buildpackage pristine-tar \
+            libdistro-info-perl \
+            quilt
+
+      - name: Install current(ish) Debian keyrings
+        if: ${{! inputs.source-hash}}
+        run: |
+          exec 2>&1; set -x
+          cd /tmp
+          chdist create debian-unstable $DEBIAN_MIRROR unstable main
+          echo 'Acquire::Languages "none";' >> ~/.chdist/debian-unstable/etc/apt/apt.conf
+          sed -i '/^deb-src/ s/^/#/' ~/.chdist/debian-unstable/etc/apt/sources.list
+          chdist apt-get debian-unstable --error-on=any update
+          chdist apt-get debian-unstable download \
+            debian-keyring \
+            debian-tag2upload-keyring
+          sudo dpkg -i debian-*keyring_*.deb
+          # This won't be necessary in >=questing
+          # (see https://wiki.debian.org/tag2upload)
+          tee ~/.devscripts <<< DSCVERIFY_KEYRINGS=/usr/share/keyrings/debian-tag2upload.pgp
+
+      - name: Set up bubblewrap
+        run: |
+          exec 2>&1; set -x
+          sudo apparmor_parser /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          bwrap --ro-bind / / true
+
+      - name: Patch dpkg to speed up source package builds
+        run: (cd / && sudo patch -p1) < misc/dpkg-source-build.patch 2>&1
+
+      - name: Download xtradeb-convert
+        run: |
+          exec 2>&1
+          base_url=https://bitbucket.org/xtradeb/xtradeb-convert
+          if [ "_$ARG_XD_CONVERT_REV" = _iskunk ]
+          then
+            # Special case
+            case "$ARG_PPA" in
+              no-upload|test) ;;
+              *) echo 'Error: Cannot upload to production PPA using development repo'; exit 1 ;;
+            esac
+            base_url=https://github.com/iskunk/xtradeb-convert
+            ARG_XD_CONVERT_REV=devel
+          fi
+          (set -x; git clone --depth=1 $base_url.git)
+          if [ -n "$ARG_XD_CONVERT_REV" ]
+          then
+            (set -x; git -C xtradeb-convert fetch origin "$ARG_XD_CONVERT_REV")
+            (set -x; git -C xtradeb-convert switch -d FETCH_HEAD)
+          fi
+          echo ' '
+          commit_id=$(git -C xtradeb-convert log -n1 --format='%H')
+          echo "Commit ID: $commit_id"
+          echo ' '
+          printf 'Xtradeb-convert Git commit ID: [`%s`](%s/commits/%s)\n\n' $commit_id $base_url $commit_id >> $GITHUB_STEP_SUMMARY
+
+      - name: Restore orig source cache if present
+        id: restore-cache
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{steps.info.outputs.cache-key}}
+          path: orig
+
+      - name: Download and unpack source package
+        if: steps.info.outputs.source-type == 'dsc'
+        id: download-dsc
+        env:
+          PACKAGE: ${{steps.info.outputs.package}}
+          VERSION: ${{steps.info.outputs.version}}
+        run: |
+          exec 2>&1
+          mkdir source
+          if [ -f orig/.cached ]
+          then
+            # Use cached orig source tarball(s)
+            ln -v orig/*.orig* source/
+            echo ' '
+          fi
+          (cd source && set -x && dget --download-only ${ARG_SOURCE_HASH:+--allow-unauthenticated} $ARG_SOURCE)
+          echo ' '
+          if [ -n "$ARG_SOURCE_HASH" ]
+          then
+            hash=$(cat source/*.dsc | sha256sum | awk '{ print "sha256:" $1 }')
+            if [ "_$hash" = "_$ARG_SOURCE_HASH" ]
+            then
+              echo 'Source .dsc file matches provided hash.'
+              echo ' '
+            else
+              echo 'Error: Source .dsc file DOES NOT match provided hash!'
+              echo "Errant hash: $hash"
+              exit 1
+            fi
+          fi
+          ls -l source
+          echo ' '
+          echo 'SHA-256 sums:'
+          (cd source && sha256sum *)
+          echo ' '
+          size=$(du -ks source | awk '{print $1}')
+          if [ $size -gt 32768 -a ! -f orig/.cached ]
+          then
+            # Cache the orig source tarball(s)
+            mkdir orig
+            for orig in source/*.orig.tar.* source/*.orig-*.tar.*
+            do
+              test -f $orig || continue
+              ln $orig orig/
+            done
+            touch orig/.cached
+            echo save-cache=true >> $GITHUB_OUTPUT
+          fi
+          if [ $size -gt 524288 ]
+          then
+            # Will need more space for the test build
+            echo purge-needed=true >> $GITHUB_OUTPUT
+          fi
+          (cd source && set -x && dpkg-source --skip-patches --extract *.dsc)
+          echo ' '
+          (set -x; dpkg-parsechangelog -l source/*/debian/changelog -c 1)
+          echo ' '
+          # Ensure consistency with the information we gleaned earlier
+          dch_package=$(dpkg-parsechangelog -l source/*/debian/changelog -S Source)
+          dch_version=$(dpkg-parsechangelog -l source/*/debian/changelog -S Version)
+          # Version in .dsc filename does not include the epoch
+          dch_version_noepoch=$(sed -r 's/^[0-9]+://' <<< $dch_version)
+          if [ "_$dch_package//$dch_version_noepoch" != "_$PACKAGE//$VERSION" ]
+          then
+            echo 'error: name and/or version of package in changelog appears to have changed:'
+            echo "  previous: $PACKAGE $VERSION"
+            echo "   current: $dch_package $dch_version_noepoch"
+            exit 1
+          fi
+          echo "DCH_VERSION=$dch_version" >> $GITHUB_ENV
+
+      - name: Build source package from Git repository
+        if: steps.info.outputs.source-type == 'git'
+        id: download-git
+        env:
+          PACKAGE: ${{steps.info.outputs.package}}
+          VERSION: ${{steps.info.outputs.version}}
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          mkdir source
+          if [ -f orig/.cached ]
+          then
+            # Use cached source package
+            ln -v orig/*.* source/
+            echo ' '
+          else
+            mkdir git-work
+            export SECURE_WRAP_RW_DIRS=$PWD/git-work
+            (set -x; git clone --depth=10 --no-single-branch $ARG_SOURCE git-work/git-repo)
+            echo ' '
+            (set -x; git -C git-work/git-repo log -n1) | sed 's/^$/ /'
+            echo ' '
+            if [ -f git-work/git-repo/debian/gbp.conf ]
+            then
+              (set -x; cd git-work/git-repo && secure_wrap gbp buildpackage -S -d -nc -uc -us)
+            else
+              (set -x; cd git-work/git-repo && secure_wrap dpkg-buildpackage -S -d -nc -uc -us)
+            fi
+            mkdir orig
+            for srcpkg_file in \
+              git-work/"$PACKAGE"_*.dsc \
+              git-work/"$PACKAGE"_*.tar.*
+            do
+              test -f $srcpkg_file || continue
+              ln $srcpkg_file source/
+              ln $srcpkg_file orig/
+            done
+            touch orig/.cached
+            echo save-cache=true >> $GITHUB_OUTPUT
+          fi
+          echo ' '
+          ls -l source
+          echo ' '
+          echo 'SHA-256 sums:'
+          (cd source && sha256sum *)
+          echo ' '
+          (cd source && set -x && dpkg-source --skip-patches --extract *.dsc)
+          echo ' '
+          (set -x; dpkg-parsechangelog -l source/*/debian/changelog -c 1)
+          echo ' '
+          # Ensure consistency with the information we obtained earlier
+          dch_package=$(dpkg-parsechangelog -l source/*/debian/changelog -S Source)
+          dch_version=$(dpkg-parsechangelog -l source/*/debian/changelog -S Version)
+          if [ "_$dch_package//$dch_version" != "_$PACKAGE//$VERSION" ]
+          then
+            echo 'error: name and/or version of package in changelog appears to have changed:'
+            echo "  previous: $PACKAGE $VERSION"
+            echo "   current: $dch_package $dch_version"
+            exit 1
+          fi
+          echo "DCH_VERSION=$dch_version" >> $GITHUB_ENV
+
+      - name: Save orig source cache (if applicable)
+        if: >-
+          steps.download-dsc.outputs.save-cache ||
+          steps.download-git.outputs.save-cache
+        uses: actions/cache/save@v5
+        with:
+          key: ${{steps.info.outputs.cache-key}}
+          path: orig
+
+      - name: Check which Ubuntu releases already have this package version (or newer)
+        if: ${{! inputs.subset-release}}
+        env:
+          PACKAGE: ${{steps.info.outputs.package}}
+        run: |
+          exec 2>&1
+          test -n "$DCH_VERSION"
+          dch_upstream_version=${DCH_VERSION%-*}
+          (set -x; rmadison -a source $PACKAGE) | tee madison.txt
+          awk '{ print $3 "\t" $5 }' madison.txt \
+          | while read rel_ver suite_component
+          do
+            if dpkg --compare-versions "$rel_ver" ge "$dch_upstream_version"
+            then
+              suite=$(sed 's![-/].*!!' <<< $suite_component)
+              echo "$suite" >> tmp.reject
+            fi
+          done
+          echo ' '; echo 'Result:'
+          if [ -f tmp.reject ]
+          then
+            sort -u tmp.reject | tee not-needed-releases.txt
+            rm tmp.reject
+          else
+            echo '(none)'
+          fi
+
+      - name: Convert source and create Ubuntu source packages
+        id: convert
+        env:
+          PACKAGE: ${{steps.info.outputs.package}}
+          VERSION: ${{steps.info.outputs.version}}
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          cd source
+          srcpkg_dir=$(dirname $(echo */debian))
+          cp -a $srcpkg_dir/debian debian.orig
+          cat >> $GITHUB_STEP_SUMMARY << END
+          | Release | New DSC file |
+          | ------- | ------------ |
+          END
+          export SECURE_WRAP_RW_DIRS=$srcpkg_dir/debian
+          export XTRADEB_VERSION_MAJOR=$ARG_XD_VERSION_MAJOR
+          export XTRADEB_VERSION_MINOR=$ARG_XD_VERSION_MINOR
+          changelog=$srcpkg_dir/debian/changelog
+          orig_src_opt=
+          for codename in $(tr -d '\r' <<< $CODENAME_LIST)
+          do
+            test -z "$ARG_SUBSET_RELEASE" -o "_$ARG_SUBSET_RELEASE" = _NO_VERSION_CHECK \
+            || grep -Fqw $codename <<< $ARG_SUBSET_RELEASE \
+            || continue
+            test ! -f ../not-needed-releases.txt \
+            || ! grep -Fqx $codename ../not-needed-releases.txt \
+            || continue
+            echo "::group::Create source package for $codename"
+            rm -rf $srcpkg_dir/debian
+            cp -a debian.orig $srcpkg_dir/debian
+            ret=0
+            secure_wrap ../xtradeb-convert/convert.sh $srcpkg_dir/debian $codename || ret=$?
+            case $ret in
+              0)
+              echo ' '
+              if [ -s $srcpkg_dir/debian/patches/series ]
+              then
+                # Verify that the patch series applies
+                (set -x; cd $srcpkg_dir && QUILT_PATCHES=debian/patches quilt push -aq --fuzz=0 && quilt pop -aq)
+              else
+                echo 'This source package does not include a patch series.'
+              fi
+              echo ' '
+              (set -x; dpkg-parsechangelog -l $changelog -c 1)
+              echo ' '
+              (set -x; dpkg-source --no-preparation --no-generate-diff --build $srcpkg_dir)
+              echo ' '
+              dch_ver_noepoch=$(dpkg-parsechangelog -l $changelog -S Version | sed -r 's/^[0-9]+://')
+              # Note: "a" = include orig source, "d" = exclude orig source
+              if [ -z "$orig_src_opt" ]
+              then
+                case $ARG_INCLUDE_SOURCE in
+                  auto)
+                  orig_src_opt=$(grep -Pq 'xtradeb1\.\d{4}\.1$' <<< $dch_ver_noepoch && echo a || echo d)
+                  case $ARG_SOURCE in */ubuntu/pool/*) orig_src_opt=d ;; esac
+                  ;;
+                  yes) orig_src_opt=a ;;
+                  no) orig_src_opt=d ;;
+                esac
+              else
+                orig_src_opt=d
+              fi
+              new_changes_file=${PACKAGE}_${dch_ver_noepoch}_source.changes
+              (cd $srcpkg_dir && set -x && dpkg-genchanges --build=source -s$orig_src_opt) > $new_changes_file
+              echo $new_changes_file >> changes-files.txt
+              echo $codename >> test-matrix.txt
+              new_dsc_file=$(ls -1t *.dsc | head -n1)
+              echo $new_dsc_file > dsc-file.$codename.txt
+              echo "| Ubuntu $codename | \`$new_dsc_file\` |" >> $GITHUB_STEP_SUMMARY
+              ;;
+              2) ;;  # not applicable/needed for this release
+              3) ;;  # not supported on this release
+              *) exit $ret ;;
+            esac
+            echo '::endgroup::'
+          done
+          rm -rf debian.orig $srcpkg_dir
+          if [ ! -s test-matrix.txt ]
+          then
+            echo 'error: no packages converted'
+            exit 1
+          fi
+          # E.g. test_matrix = ["jammy","noble"]
+          test_matrix=$(jq -Rn --indent 0 '[ inputs ]' test-matrix.txt)
+          echo "test-matrix=$test_matrix" >> $GITHUB_OUTPUT
+          echo ' '
+          echo 'SHA-256 sums:'
+          sha256sum * | grep -Ev '\.(sh|txt)$'
+          # Tar up xtradeb-convert to put it in an artifact
+          (cd .. && tar czf xtradeb-convert.tar.gz --exclude=xtradeb-convert/.git xtradeb-convert)
+
+      - name: Save a copy of xtradeb-convert
+        uses: actions/upload-artifact@v6
+        with:
+          name: tmp-xtradeb-convert
+          compression-level: 0
+          retention-days: 1
+          path: xtradeb-convert.tar.gz
+
+      - name: Save candidate source packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: source-packages
+          compression-level: 0
+          retention-days: 1
+          path: source
+
+  test-build:
+    needs: [prep-source]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        codename: ${{fromJSON(needs.prep-source.outputs.test-matrix)}}
+    container:
+      image: ubuntu:${{matrix.codename}}
+      options: -v /:/HOST
+    defaults:
+      run:
+        shell: bash
+    env:
+      CODENAME: ${{matrix.codename}}
+      DEBIAN_FRONTEND: noninteractive
+      UBUNTU_MIRROR: ${{needs.prep-source.outputs.ubuntu-mirror}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v6
+
+      - name: Free up some working space
+        if: needs.prep-source.outputs.purge-needed
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          purge_runner
+
+      - name: Update APT config
+        run: |
+          # Remove backports suite, and multiverse/restricted components
+          perl -pi \
+            -e 'BEGIN { $comps = qr/(multiverse|restricted)/; }' \
+            -e 'if (/^deb/) {' \
+            -e '  if (/ \w+-backports /) { s/^/#xd#/; next; }' \
+            -e '  if (/ main\b/) { s/ $comps\b//g; }' \
+            -e '  else { s/^/#xd#/ if / $comps\b/; }' \
+            -e '}' \
+            -e 's/ \w+-backports\b//g if /^Suites:/;' \
+            -e 's/ $comps\b//g if /^Components:/;' \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ubuntu.sources
+          # Don't use the official Ubuntu package servers
+          perl -pi \
+            -e '/^(deb|URIs:)/ or next;' \
+            -e "s!https?://(archive|security)\\.ubuntu\\.com/ubuntu!$UBUNTU_MIRROR!;" \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ubuntu.sources
+          # Add the XtraDeb "deps" repo for build-dependencies
+          sed "s/@SUITE@/$CODENAME/" misc/xtradeb-deps.sources.in > /etc/apt/sources.list.d/xtradeb-deps.sources
+
+      - name: Install required packages
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          apt_get_install --update \
+            devscripts \
+            dpkg-dev \
+            equivs \
+            fakeroot \
+            lintian \
+            zstd
+
+      - name: Get artifact with source packages
+        uses: actions/download-artifact@v7
+        with:
+          name: source-packages
+          path: source
+
+      - name: Create normal user to run the build
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          run_as_user
+          chown -R build:users source
+
+      - name: Unpack appropriate source package
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          cd source
+          dsc_file=$(cat dsc-file.$CODENAME.txt)
+          run_as_user "dpkg-source --extract $dsc_file"
+
+      - name: Set up test build options/profiles
+        id: conf
+        env:
+          ARG_MAX_TIME: ${{inputs.max-time}}
+        run: |
+          exec 2>&1
+          xd_build_options=$(misc/deb822-field.pl \
+            --space-sep \
+            --validate-regex='[a-z][0-9a-z]{,15}' \
+            XS-XtraDeb-Test-Build-Options \
+            source/*/debian/control)
+          xd_build_profiles=$(misc/deb822-field.pl \
+            --space-sep \
+            --validate-regex='!?[a-z][-0-9a-z.]{,31}' \
+            XS-XtraDeb-Test-Build-Profiles \
+            source/*/debian/control)
+          nl='
+          '
+          xd_build_options=${xd_build_options//$nl/ }
+          xd_build_profiles=${xd_build_profiles//$nl/ }
+          (test -z "$xd_build_options"  || echo "export DEB_BUILD_OPTIONS='$xd_build_options'"
+           test -z "$xd_build_profiles" || echo "export DEB_BUILD_PROFILES='$xd_build_profiles'"
+          ) | tee source/test-build-env.sh
+          echo max-time-plus=$((ARG_MAX_TIME + 5)) >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: |
+          exec 2>&1
+          xd_build_depends=$(misc/deb822-field.pl \
+            --comma-sep \
+            --validate-regex='[0-9a-z][-0-9a-z]{,64}/[a-z]{,12}' \
+            XS-XtraDeb-Test-Build-Depends \
+            source/*/debian/control)
+          mkdir /tmp/deps; cd /tmp/deps
+          # XtraDeb package build dependencies
+          while read dep
+          do
+            test -n "$dep" || continue  # :P
+            echo "XD-T-B-D: $dep"
+            pkg=${dep%/*}; rel=${dep#*/}
+            if [ ! -d ~/.chdist/xd-tbd-$rel ]
+            then
+              (set -x; chdist create xd-tbd-$rel $UBUNTU_MIRROR $rel main universe)
+              sed -i '/^deb-src /d' ~/.chdist/xd-tbd-$rel/etc/apt/sources.list
+              echo 'Acquire::Languages "none";' > ~/.chdist/xd-tbd-$rel/etc/apt/apt.conf.d/95xtradeb
+              (set -x; chdist apt-get xd-tbd-$rel --error-on=any update)
+            fi
+            (set -x; chdist apt-get xd-tbd-$rel download $pkg)
+          done <<< $xd_build_depends
+          echo ' '
+          # Normal package build dependencies
+          . $GITHUB_WORKSPACE/misc/functions.sh
+          . $GITHUB_WORKSPACE/source/test-build-env.sh
+          (set -x; mk-build-deps $GITHUB_WORKSPACE/source/*/debian/control)
+          echo ' '
+          extra_arg=$(test -f /usr/lib/systemd/user/dbus.service || echo 'dbus-user-session:*-')
+          apt_get_install ./*.deb $extra_arg
+
+      - name: Perform test build
+        id: build
+        timeout-minutes: ${{fromJSON(steps.conf.outputs.max-time-plus)}}
+        env:
+          TIMEOUT: timeout --foreground --verbose --kill-after=30s ${{inputs.max-time}}m
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          cd source/*/debian/..
+          (set -x; pwd)
+          ret=0
+          run_as_user ". ../test-build-env.sh && $TIMEOUT dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
+          sleep 5
+          echo ================================================================
+          case $ret in
+            0)
+            echo 'Build completed successfully'
+            echo completed=true >> $GITHUB_OUTPUT
+            ;;
+            124)
+            echo 'Partial build result is GOOD'
+            echo completed= >> $GITHUB_OUTPUT
+            ;;
+            125)  # observed on questing
+            echo 'Partial build result is GOOD -- timeout(1) errored out'
+            echo completed= >> $GITHUB_OUTPUT
+            ;;
+            *)
+            echo "Build FAILED with status $ret"
+            exit $ret
+            ;;
+          esac
+
+      - name: Get xtradeb-convert artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: tmp-xtradeb-convert
+
+      - name: Check the built binary package(s)
+        if: ${{steps.build.outputs.completed}}
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          tar xzf xtradeb-convert.tar.gz
+          cd source
+          run_as_user "UBUNTU_APT_URL=$UBUNTU_MIRROR ../xtradeb-convert/check.sh $CODENAME ./*.deb"
+
+  upload:
+    needs: [prep-source, test-build]
+    if: inputs.ppa != 'no-upload'
+    runs-on: ubuntu-24.04
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v6
+
+      - name: Update APT config
+        env:
+          UBUNTU_MIRROR: ${{needs.prep-source.outputs.ubuntu-mirror}}
+        run: |
+          exec 2>&1
+          if ! grep -Fq $UBUNTU_MIRROR /etc/apt/apt-mirrors.txt
+          then
+            sudo sed -ri "s!^(URIs): .*!\\1: $UBUNTU_MIRROR!" /etc/apt/sources.list.d/ubuntu.sources
+            sudo rm -v /etc/apt/apt-mirrors.txt
+          fi
+
+      - name: Install required packages
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          apt_get_install --update \
+            devscripts \
+            dput-ng \
+            python3-paramiko
+
+      - name: Get artifact with source packages
+        uses: actions/download-artifact@v7
+        with:
+          name: source-packages
+          path: source
+
+      - name: Sign source packages
+        env:
+          GPG_SIGNING_KEY: ${{secrets.GPG_SIGNING_KEY}}
+          PATH: /usr/bin:/bin
+        run: |
+          rm -rf ~/.gnupg
+          (set -x; gpg --import <<< $GPG_SIGNING_KEY)
+          unset GPG_SIGNING_KEY
+          echo ' '
+          (set -x; debsign -S --no-re-sign source/*.changes)
+          gpgconf --kill all  # get rid of gpg-agent
+          rm -r ~/.gnupg
+
+      - name: Upload source packages to Launchpad (~xtradeb/${{inputs.ppa}})
+        env:
+          ARG_PPA: ${{inputs.ppa}}
+          SSH_UPLOAD_KEY: ${{secrets.SSH_UPLOAD_KEY}}
+          PATH: /usr/bin:/bin
+        run: |
+          mkdir ~/.ssh
+          (umask 077; echo "$SSH_UPLOAD_KEY" > ~/.ssh/id_ed25519)
+          cp misc/ssh_known_hosts ~/.ssh/known_hosts
+          cp misc/dput.cf ~/.dput.cf
+          changes_files=$(cat source/changes-files.txt)
+          (cd source && set -x && dput "xtradeb-$ARG_PPA" $changes_files)
+          rm -r ~/.ssh
+          echo ' '
+          echo 'Upload complete.'
+
+      - name: Save uploaded files and upload logs
+        uses: actions/upload-artifact@v6
+        with:
+          name: upload-files
+          compression-level: 9
+          # Note: Do not save the orig source, as we do not modify it
+          path: |
+            source/*xtradeb*.dsc
+            source/*xtradeb*.debian.*
+            source/*xtradeb*_source.changes
+            source/*.upload
+
+# end package.yml

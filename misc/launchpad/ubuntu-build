@@ -1,0 +1,512 @@
+#!/usr/bin/python3
+#
+#   ubuntu-build - command line interface for Launchpad buildd operations.
+#
+#   Copyright (C) 2007-2024 Canonical Ltd.
+#   Authors:
+#    - Martin Pitt <martin.pitt@canonical.com>
+#    - Jonathan Davies <jpds@ubuntu.com>
+#    - Michael Bienia <geser@ubuntu.com>
+#    - Steve Langasek <steve.langasek@canonical.com>
+#    - Daniel Richard G. <skunk@iSKUNK.ORG>
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, version 3 of the License.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# pylint: disable=invalid-name
+# pylint: enable=invalid-name
+
+import argparse
+import sys
+
+import lazr.restfulclient.errors
+from launchpadlib.launchpad import Launchpad
+
+from ubuntutools import getLogger
+from ubuntutools.lp.udtexceptions import PocketDoesNotExistError
+from ubuntutools.misc import split_release_pocket
+
+Logger = getLogger()
+
+
+def is_soft_failed(build):
+    if not build.buildstate in (
+        "Failed to build",
+        "Dependency wait",
+        "Chroot problem",
+        "Failed to upload"
+    ):
+        return False
+    if build.build_log_url and build.buildstate != "Chroot problem":
+        return False
+    return True
+
+
+def get_build_states(pkg, archs):
+    res = []
+
+    for build in pkg.getBuilds():
+        if build.arch_tag in archs:
+            res.append(f"  {build.arch_tag}: {build.buildstate}")
+    msg = "\n".join(res)
+    return f"Build state(s) for '{pkg.source_package_name}':\n{msg}"
+
+
+def rescore_builds(pkg, archs, score, dry_run=False):
+    res = []
+
+    for build in pkg.getBuilds():
+        arch = build.arch_tag
+        if arch in archs:
+            if not build.can_be_rescored:
+                continue
+            try:
+                dry_run or build.rescore(score=score)
+                res.append(f"  {arch}: done")
+            except lazr.restfulclient.errors.Unauthorized:
+                Logger.error(
+                    "You don't have the permissions to rescore builds."
+                    " Ignoring your rescore request."
+                )
+                return None
+            except lazr.restfulclient.errors.BadRequest:
+                Logger.info("Cannot rescore build of %s on %s.", build.source_package_name, arch)
+                res.append(f"  {arch}: failed")
+
+    msg = "\n".join(res)
+    return f"Rescoring builds of '{pkg.source_package_name}' to {score}:\n{msg}"
+
+
+def retry_builds(pkg, archs, dry_run=False):
+    res = []
+    for build in pkg.getBuilds():
+        arch = build.arch_tag
+        if arch in archs:
+            if not build.can_be_retried:
+                continue
+            try:
+                dry_run or build.retry()
+                res.append(f"  {arch}: done")
+            except lazr.restfulclient.errors.BadRequest:
+                res.append(f"  {arch}: failed")
+    msg = "\n".join(res)
+    return f"Retrying builds of '{pkg.source_package_name}':\n{msg}"
+
+
+def parse_args(argv: list[str], valid_archs: set[str]) -> argparse.Namespace:
+    """Parse command line arguments and return namespace."""
+    # Usage.
+    usage = "%(prog)s <srcpackage> <release> <operation>\n\n"
+    usage += "Where operation may be one of: rescore, retry, retry-soft-failed, or status.\n"
+    usage += "Only Launchpad Buildd Admins may rescore package builds."
+
+    # Prepare our option parser.
+    parser = argparse.ArgumentParser(usage=usage)
+
+    parser.add_argument(
+        "-a",
+        "--arch",
+        action="append",
+        dest="architecture",
+        help=f"Rebuild or rescore a specific architecture. Valid architectures "
+        f"include: {', '.join(valid_archs)}.",
+    )
+
+    parser.add_argument("-A", "--archive", help="operate on ARCHIVE", default="ubuntu")
+
+    parser.add_argument("-n", "--dry-run", action="store_true", help="don't make any changes")
+
+    parser.add_argument("-v", "--version", help="operate on specific version of package")
+
+    # Batch processing options
+    batch_options = parser.add_argument_group(
+        "Batch processing",
+        "These options and parameter ordering is only "
+        "available in --batch mode.\nUsage: "
+        "ubuntu-build --batch [options] <package>...",
+    )
+    batch_options.add_argument(
+        "--batch", action="store_true", dest="batch", help="Enable batch mode"
+    )
+    batch_options.add_argument(
+        "--series",
+        action="store",
+        dest="series",
+        help="Selects the Ubuntu series to operate on (default: current development series)",
+    )
+    batch_options.add_argument(
+        "--retry", action="store_true", dest="retry", help="Retry builds (give-back)."
+    )
+    batch_options.add_argument(
+        "--rescore",
+        action="store",
+        dest="priority",
+        type=int,
+        help="Rescore builds to <priority>.",
+    )
+    batch_options.add_argument(
+        "--state",
+        action="store",
+        dest="state",
+        help="Act on builds that are in the specified state",
+    )
+
+    parser.add_argument("packages", metavar="package", nargs="*", help=argparse.SUPPRESS)
+
+    # Parse our options.
+    args = parser.parse_args(argv)
+
+    if not args.batch:
+        # Check we have the correct number of arguments.
+        if len(args.packages) < 3:
+            parser.error("Incorrect number of arguments.")
+
+    return args
+
+
+def main():
+    # Valid architectures.
+    valid_archs = set(
+        ["armhf", "arm64", "amd64", "amd64v3", "i386", "powerpc", "ppc64el", "riscv64", "s390x"]
+    )
+
+    args = parse_args(sys.argv[1:], valid_archs)
+
+    operation = "status"
+
+    if not args.batch:
+        # Check we have the correct number of arguments.
+        if len(args.packages) < 3:
+            parser.error("Incorrect number of arguments.")
+        try:
+            package = str(args.packages[0]).lower()
+            release = str(args.packages[1]).lower()
+            operation = str(args.packages[2]).lower()
+        except IndexError:
+            parser.print_help()
+            sys.exit(1)
+        # Check our operation.
+        if operation not in ("rescore", "retry", "retry-soft-failed", "status"):
+            Logger.error("Invalid operation: %s.", operation)
+            sys.exit(1)
+
+    if not args.dry_run and (args.retry or args.priority or operation != "status"):
+        launchpad = Launchpad.login_with("ubuntu-dev-tools", "production", version="devel")
+    else:
+        launchpad = Launchpad.login_anonymously("ubuntu-dev-tools", "production", version="devel")
+    ubuntu = launchpad.distributions["ubuntu"]
+
+    if args.batch:
+        release = args.series
+        if not release:
+            # ppas don't have a proposed pocket so just use the release pocket;
+            # but for the main archive we default to -proposed
+            release = ubuntu.getDevelopmentSeries()[0].name
+            if args.archive == "ubuntu":
+                release = f"{release}-proposed"
+        try:
+            (release, pocket) = split_release_pocket(release)
+        except PocketDoesNotExistError as error:
+            Logger.error(error)
+            sys.exit(1)
+    else:
+        package = str(args.packages[0]).lower()
+        release = str(args.packages[1]).lower()
+        operation = str(args.packages[2]).lower()
+
+    archive = launchpad.archives.getByReference(reference=args.archive)
+    try:
+        distroseries = ubuntu.getSeries(name_or_version=release.split("-")[0])
+    except lazr.restfulclient.errors.NotFound as error:
+        Logger.error(error)
+        sys.exit(1)
+
+    if not args.batch:
+        # If the user has specified an architecture to build, we only wish to
+        # rebuild it and nothing else.
+        if args.architecture:
+            if args.architecture[0] not in valid_archs:
+                Logger.error("Invalid architecture specified: %s.", args.architecture[0])
+                sys.exit(1)
+            else:
+                one_arch = True
+        else:
+            one_arch = False
+
+        # split release and pocket
+        try:
+            (release, pocket) = split_release_pocket(release)
+        except PocketDoesNotExistError as error:
+            Logger.error(error)
+            sys.exit(1)
+
+        # Get list of published sources for package in question.
+        try:
+            sources = archive.getPublishedSources(
+                distro_series=distroseries,
+                exact_match=True,
+                pocket=pocket,
+                source_name=package,
+                version=args.version if args.version else None
+            )[0]
+        except IndexError:
+            if args.version:
+                Logger.error("No publication found for package %s version %s", package, args.version)
+            else:
+                Logger.error("No publication found for package %s", package)
+            sys.exit(1)
+        # Get list of builds for that package.
+        builds = sources.getBuilds()
+
+        # Find out the version and component in given release.
+        version = sources.source_package_version
+        component = sources.component_name
+
+        # Operations that are remaining may only be done by Ubuntu developers
+        # (retry) or buildd admins (rescore). Check if the proper permissions
+        # are in place.
+        if not args.dry_run and operation in ("retry", "retry-soft-failed"):
+            necessary_privs = archive.checkUpload(
+                component=component,
+                distroseries=distroseries,
+                person=launchpad.me,
+                pocket=pocket,
+                sourcepackagename=sources.source_package_name,
+            )
+            if not necessary_privs:
+                Logger.error(
+                    "You cannot perform the %s operation on a %s package as you"
+                    " do not have the permissions to do this action.",
+                    operation,
+                    component,
+                )
+                sys.exit(1)
+
+        builds_in_progress = False
+
+        # Output details.
+        Logger.info(
+            "The source version for '%s' in '%s' (%s) is: %s",
+            package,
+            release,
+            pocket,
+            version,
+        )
+
+        Logger.info(f"Build state(s) for '{sources.source_package_name}':")
+
+        # Output list of arches for package and their status.
+        done = False
+        for build in builds:
+            if one_arch and build.arch_tag != args.architecture[0]:
+                # Skip this architecture.
+                continue
+
+            done = True
+            soft = " (soft failure)" if is_soft_failed(build) else ""
+            Logger.info("  %s: %s%s", build.arch_tag, build.buildstate, soft)
+
+            if build.buildstate in (
+                "Needs building",
+                #???#"Build for superseded Source",
+                "Currently building",
+                "Uploading build",
+                "Cancelling build"
+            ):
+                builds_in_progress = True
+
+            if operation == "rescore":
+                if build.can_be_rescored:
+                    priority = args.priority or 5000
+                    Logger.info("    Rescoring build %s to %d...", build.arch_tag, priority)
+                    try:
+                        args.dry_run or build.rescore(score=priority)
+                    except lazr.restfulclient.errors.Unauthorized:
+                        Logger.error(
+                            "    You don't have the permissions to rescore builds."
+                            " Ignoring your rescore request."
+                        )
+                        break
+                else:
+                    Logger.info("    Cannot rescore build on %s.", build.arch_tag)
+            if operation in ("retry", "retry-soft-failed"):
+                if build.can_be_retried:
+                    if operation == "retry" or is_soft_failed(build):
+                        Logger.info("    Retrying build on %s...", build.arch_tag)
+                        args.dry_run or build.retry()
+                elif operation == "retry":
+                    Logger.info("    Cannot retry build on %s.", build.arch_tag)
+
+        if operation == "status" and builds_in_progress:
+            Logger.info("Build(s) in progress")
+
+        # We are done
+        if done:
+            sys.exit(0)
+
+        Logger.info("No builds for '%s' found in the %s release", package, release.capitalize())
+        Logger.info("It may have been built in a former release.")
+        sys.exit(0)
+
+    # Batch mode
+
+    if not args.architecture:
+        # no specific architectures specified, assume all valid ones
+        archs = valid_archs
+    else:
+        archs = set(args.architecture)
+
+    # filter out duplicate and invalid architectures
+    archs.intersection_update(valid_archs)
+
+    if not args.packages:
+        retry_count = 0
+        can_rescore = True
+
+        if not args.state:
+            if args.retry:
+                args.state = "Failed to build"
+            elif args.priority:
+                args.state = "Needs building"
+        # there is no equivalent to series.getBuildRecords() for a ppa.
+        # however, we don't want to have to traverse all build records for
+        # all series when working on the main archive, so we use
+        # series.getBuildRecords() for ubuntu and handle ppas separately
+        series = ubuntu.getSeries(name_or_version=release)
+        if args.archive == "ubuntu":
+            builds = series.getBuildRecords(build_state=args.state, pocket=pocket)
+        else:
+            builds = []
+            gbr_args = { "pocket": pocket }
+            if args.state:
+                gbr_args["build_state"] = args.state
+            for build in archive.getBuildRecords(**gbr_args):
+                if not build.current_source_publication:
+                    continue
+                if build.current_source_publication.distro_series == series:
+                    builds.append(build)
+        for build in builds:
+            if build.arch_tag not in archs:
+                continue
+            if not build.current_source_publication:
+                continue
+            # fixme: refactor
+            # Check permissions (part 2): check upload permissions for the
+            # source package
+            if args.retry:
+                can_retry = args.dry_run or archive.checkUpload(
+                    component=build.current_source_publication.component_name,
+                    distroseries=series,
+                    person=launchpad.me,
+                    pocket=pocket,
+                    sourcepackagename=build.source_package_name,
+                )
+                if not can_retry:
+                    Logger.error(
+                        "You don't have the permissions to retry the build of '%s', skipping.",
+                        build.source_package_name,
+                    )
+                    continue
+            Logger.info(
+                "The source version of '%s' for '%s' in '%s' (%s) is: %s",
+                build.source_package_name,
+                build.arch_tag,
+                release,
+                pocket,
+                build.source_package_version,
+            )
+
+            if args.retry and build.can_be_retried:
+                Logger.info(
+                    "Retrying build of %s on %s...", build.source_package_name, build.arch_tag
+                )
+                try:
+                    args.dry_run or build.retry()
+                    retry_count += 1
+                except lazr.restfulclient.errors.BadRequest:
+                    Logger.info(
+                        "Failed to retry build of %s on %s",
+                        build.source_package_name,
+                        build.arch_tag,
+                    )
+
+            if args.priority and can_rescore:
+                if build.can_be_rescored:
+                    try:
+                        args.dry_run or build.rescore(score=args.priority)
+                    except lazr.restfulclient.errors.Unauthorized:
+                        Logger.error(
+                            "You don't have the permissions to rescore builds."
+                            " Ignoring your rescore request."
+                        )
+                        can_rescore = False
+                    except lazr.restfulclient.errors.BadRequest:
+                        Logger.info(
+                            "Cannot rescore build of %s on %s.",
+                            build.source_package_name,
+                            build.arch_tag,
+                        )
+
+            Logger.info("")
+        if args.retry:
+            Logger.info("%d package builds retried", retry_count)
+        sys.exit(0)
+
+    for pkg in args.packages:
+        try:
+            pkg = archive.getPublishedSources(
+                distro_series=distroseries,
+                exact_match=True,
+                pocket=pocket,
+                source_name=pkg,
+                status="Published",
+            )[0]
+        except IndexError:
+            Logger.error("No publication found for package %s", pkg)
+            continue
+
+        # Check permissions (part 2): check upload permissions for the source
+        # package
+        can_retry = args.dry_run or archive.checkUpload(
+            component=pkg.component_name,
+            distroseries=distroseries,
+            person=launchpad.me,
+            pocket=pocket,
+            sourcepackagename=pkg.source_package_name,
+        )
+        if args.retry and not can_retry:
+            Logger.error(
+                "You don't have the permissions to retry the "
+                "build of '%s'. Ignoring your request.",
+                pkg.source_package_name,
+            )
+
+        Logger.info(
+            "The source version for '%s' in '%s' (%s) is: %s",
+            pkg.source_package_name,
+            release,
+            pocket,
+            pkg.source_package_version,
+        )
+
+        Logger.info(get_build_states(pkg, archs))
+        if args.retry:
+            Logger.info(retry_builds(pkg, archs, args.dry_run))
+        if args.priority:
+            Logger.info(rescore_builds(pkg, archs, args.priority, args.dry_run))
+
+        Logger.info("")
+
+
+if __name__ == "__main__":
+    main()
