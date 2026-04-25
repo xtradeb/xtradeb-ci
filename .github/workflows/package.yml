@@ -574,6 +574,12 @@ jobs:
           sha256sum * | grep -Ev '\.(sh|txt)$'
           # Tar up xtradeb-convert to put it in an artifact
           (cd .. && tar czf xtradeb-convert.tar.gz --exclude=xtradeb-convert/.git xtradeb-convert)
+          # Miscellaneous
+          case "$ARG_PPA" in
+            no-upload) dest_ppa='(none)' ;;
+            *) dest_ppa="\`$ARG_PPA\`" ;;
+          esac
+          (echo; echo "Destination PPA: $dest_ppa") >> $GITHUB_STEP_SUMMARY
 
       - name: Save a copy of xtradeb-convert
         uses: actions/upload-artifact@v6
@@ -653,6 +659,7 @@ jobs:
             equivs \
             fakeroot \
             lintian \
+            time \
             zstd
 
       - name: Get artifact with source packages
@@ -738,14 +745,14 @@ jobs:
         id: build
         timeout-minutes: ${{fromJSON(steps.conf.outputs.max-time-plus)}}
         env:
-          TIMEOUT: timeout --foreground --verbose --kill-after=30s ${{inputs.max-time}}m
+          TIMEOUT: timeout --foreground -v -k 30s ${{inputs.max-time}}m
         run: |
           exec 2>&1
           . misc/functions.sh
           cd source/*/debian/..
           (set -x; pwd)
           ret=0
-          run_as_user ". ../test-build-env.sh && $TIMEOUT dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
+          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT nice -19 dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
           sleep 5
           echo ================================================================
           case $ret in
