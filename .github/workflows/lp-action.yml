@@ -59,7 +59,7 @@ jobs:
           exec 2>&1
           perl -T -C0 \
             -e '$| = 1; $c = qr/[a-z]{2,12}/; $p = qr/[0-9a-z][-0-9a-z.]{1,64}/; $s = qr/ {1,2}/;' \
-            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^$r$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
+            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^($r)$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
             -e 'chk("ARG_ACTION", qr/(copy|retry)/, "action");' \
             -e 'chk("ARG_PPA", qr/(no-upload|apps|play|deps|test)/, "PPA");' \
             -e 'chk("ARG_PACKAGE", qr/$p($s$p)*/, "package(s)");' \
@@ -77,7 +77,9 @@ jobs:
           env | awk -v FS== '/^ARG_/ {print $1 ": " $2 }' | sort
 
       - name: Clone Git repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install required packages
         run: |

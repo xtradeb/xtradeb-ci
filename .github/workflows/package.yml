@@ -6,17 +6,18 @@ on:
     inputs:
       source:
         type: string
+        required: true
       max-time:
         type: number
         default: 30
       ppa:
         type: string
-        required: false
   workflow_dispatch:
     inputs:
       source:
         type: string
-        description: URL of input package .dsc file
+        description: Package source URL (.dsc/.git)
+        required: true
       max-time:
         type: number
         description: Maximum test build duration (minutes)
@@ -24,44 +25,39 @@ on:
       ppa:
         type: choice
         options: [no-upload, apps, play, deps, test]
-        default: no-upload
         description: Upload to this XtraDeb PPA
       source-hash:
         type: string
         description: "\U0001F527 Hash (digest) of source .dsc file"
-        required: false
       subset-release:
         type: string
         description: "\U0001F527 Subset of releases to target"
         # ...specified as a space-separated list of codenames
-        required: false
       xd-convert-rev:
         type: string
         description: "\U0001F527 Git revision of xtradeb-convert"
-        required: false
       xd-version-major:
         type: number
         description: "\U0001F527 XtraDeb version major"
-        required: false
       xd-version-minor:
         type: number
         description: "\U0001F527 XtraDeb version minor"
-        required: false
       include-source:
         type: choice
-        options: ['auto', 'yes', 'no']
-        default: auto
+        options: [auto, yes, no]
         description: "\U0001F527 Include source in first upload?"
-        required: false
       run-name:
         # Workaround to the inability to change the title of the workflow
         # run after it has started (i.e. to set it to a computed value; see
         # https://github.com/orgs/community/discussions/69476)
         type: string
         description: "\U0001F527 Workflow run title"
-        required: false
 
 run-name: ${{inputs.run-name || github.workflow}}
+
+concurrency:
+  group: ${{inputs.source}}
+  cancel-in-progress: true
 
 env:
   MAIN_UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
@@ -94,6 +90,8 @@ jobs:
 
       - name: Clone Git repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Validate workflow arguments
         run: |
@@ -112,7 +110,7 @@ jobs:
           echo ' '; echo 'Second pass:'
           perl -T -C0 \
             -e '$| = 1; $c = qr/[a-z]{2,12}/; $s = qr/ {1,2}/; $ver = qr/[1-9]\d?/;' \
-            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^$r$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
+            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^($r)$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
             -e 'chk("ARG_MAX_TIME", qr/\d{1,4}/, "max time");' \
             -e 'chk("ARG_PPA", qr/(no-upload|apps|play|deps|test)/, "PPA");' \
             -e 'chk("ARG_SOURCE_HASH", qr/(sha256:[0-9a-f]{64})?/, "source hash");' \
@@ -213,7 +211,7 @@ jobs:
       #    systemctl restart php8.3-fpm.service
       #
       # after installing packages.
-      - name: Avoid delay from php*-fpm
+      - name: Avoid delays from php*-fpm
         run: |
           if ! echo /usr/lib/systemd/system/php*-fpm.service | grep -Fq '*'
           then
@@ -322,11 +320,12 @@ jobs:
           VERSION: ${{steps.info.outputs.version}}
         run: |
           exec 2>&1
+          . misc/functions.sh
           mkdir source
           if [ -f orig/.cached ]
           then
             # Use cached orig source tarball(s)
-            ln -v orig/*.orig* source/
+            (cd source && ln -sv ../orig/*.orig* .)
             echo ' '
           fi
           (cd source && set -x && dget --download-only ${ARG_SOURCE_HASH:+--allow-unauthenticated} $ARG_SOURCE)
@@ -344,7 +343,7 @@ jobs:
               exit 1
             fi
           fi
-          ls -l source
+          ls -Ll source
           echo ' '
           echo 'SHA-256 sums:'
           (cd source && sha256sum *)
@@ -354,10 +353,11 @@ jobs:
           then
             # Cache the orig source tarball(s)
             mkdir orig
-            for orig in source/*.orig.tar.* source/*.orig-*.tar.*
+            for orig in $(cd source && echo *.orig.tar.* *.orig-*.tar.*)
             do
-              test -f $orig || continue
-              ln $orig orig/
+              test -f source/$orig || continue
+              # Note: No symlinks here! The cache is a tar file
+              ln source/$orig orig/
             done
             touch orig/.cached
             echo save-cache=true >> $GITHUB_OUTPUT
@@ -371,19 +371,7 @@ jobs:
           echo ' '
           (set -x; dpkg-parsechangelog -l source/*/debian/changelog -c 1)
           echo ' '
-          # Ensure consistency with the information we gleaned earlier
-          dch_package=$(dpkg-parsechangelog -l source/*/debian/changelog -S Source)
-          dch_version=$(dpkg-parsechangelog -l source/*/debian/changelog -S Version)
-          # Version in .dsc filename does not include the epoch
-          dch_version_noepoch=$(sed -r 's/^[0-9]+://' <<< $dch_version)
-          if [ "_$dch_package//$dch_version_noepoch" != "_$PACKAGE//$VERSION" ]
-          then
-            echo 'error: name and/or version of package in changelog appears to have changed:'
-            echo "  previous: $PACKAGE $VERSION"
-            echo "   current: $dch_package $dch_version_noepoch"
-            exit 1
-          fi
-          echo "DCH_VERSION=$dch_version" >> $GITHUB_ENV
+          check_changelog_version source/*/debian/changelog $PACKAGE $VERSION
 
       - name: Build source package from Git repository
         if: steps.info.outputs.source-type == 'git'
@@ -397,8 +385,8 @@ jobs:
           mkdir source
           if [ -f orig/.cached ]
           then
-            # Use cached source package
-            ln -v orig/*.* source/
+            # Use cached source package files
+            (cd source && ln -sv ../orig/*.* .)
             echo ' '
           else
             mkdir git-work
@@ -415,18 +403,18 @@ jobs:
             fi
             mkdir orig
             for srcpkg_file in \
-              git-work/"$PACKAGE"_*.dsc \
-              git-work/"$PACKAGE"_*.tar.*
+              $(cd git-work && echo "$PACKAGE"_*.dsc "$PACKAGE"_*.tar.*)
             do
-              test -f $srcpkg_file || continue
-              ln $srcpkg_file source/
-              ln $srcpkg_file orig/
+              test -f git-work/$srcpkg_file || continue
+              ln -s ../git-work/$srcpkg_file source/
+              # Cache the source package files
+              ln git-work/$srcpkg_file orig/
             done
             touch orig/.cached
             echo save-cache=true >> $GITHUB_OUTPUT
           fi
           echo ' '
-          ls -l source
+          ls -Ll source
           echo ' '
           echo 'SHA-256 sums:'
           (cd source && sha256sum *)
@@ -435,17 +423,7 @@ jobs:
           echo ' '
           (set -x; dpkg-parsechangelog -l source/*/debian/changelog -c 1)
           echo ' '
-          # Ensure consistency with the information we obtained earlier
-          dch_package=$(dpkg-parsechangelog -l source/*/debian/changelog -S Source)
-          dch_version=$(dpkg-parsechangelog -l source/*/debian/changelog -S Version)
-          if [ "_$dch_package//$dch_version" != "_$PACKAGE//$VERSION" ]
-          then
-            echo 'error: name and/or version of package in changelog appears to have changed:'
-            echo "  previous: $PACKAGE $VERSION"
-            echo "   current: $dch_package $dch_version"
-            exit 1
-          fi
-          echo "DCH_VERSION=$dch_version" >> $GITHUB_ENV
+          check_changelog_version source/*/debian/changelog $PACKAGE $VERSION
 
       - name: Save orig source cache (if applicable)
         if: >-
@@ -462,8 +440,8 @@ jobs:
           PACKAGE: ${{steps.info.outputs.package}}
         run: |
           exec 2>&1
-          test -n "$DCH_VERSION"
-          dch_upstream_version=${DCH_VERSION%-*}
+          dch_version=$(dpkg-parsechangelog -l source/*/debian/changelog -S Version)
+          dch_upstream_version=${dch_version%-*}
           (set -x; rmadison -a source $PACKAGE) | tee madison.txt
           awk '{ print $3 "\t" $5 }' madison.txt \
           | while read rel_ver suite_component
@@ -522,7 +500,7 @@ jobs:
               if [ -s $srcpkg_dir/debian/patches/series ]
               then
                 # Verify that the patch series applies
-                (set -x; cd $srcpkg_dir && QUILT_PATCHES=debian/patches quilt push -aq --fuzz=0 && quilt pop -aq)
+                (set -x; cd $srcpkg_dir && QUILT_PATCHES=debian/patches quilt push -aq --fuzz=0 && quilt pop -afq)
               else
                 echo 'This source package does not include a patch series.'
               fi
@@ -537,11 +515,17 @@ jobs:
               then
                 case $ARG_INCLUDE_SOURCE in
                   auto)
+                  # Typically, only the first upload needs orig source...
                   orig_src_opt=$(grep -Pq 'xtradeb1\.\d{4}\.1$' <<< $dch_ver_noepoch && echo a || echo d)
-                  case $ARG_SOURCE in */ubuntu/pool/*) orig_src_opt=d ;; esac
+                  # ...unless we're pulling from the Ubuntu primary
+                  # archive, in which case no orig source is needed
+                  case $ARG_SOURCE in
+                    */ppa.launchpadcontent.net/*) ;;
+                    */ubuntu/pool/*) orig_src_opt=d ;;
+                  esac
                   ;;
                   yes) orig_src_opt=a ;;
-                  no) orig_src_opt=d ;;
+                  no)  orig_src_opt=d ;;
                 esac
               else
                 orig_src_opt=d
@@ -618,6 +602,8 @@ jobs:
 
       - name: Clone Git repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Free up some working space
         if: needs.prep-source.outputs.purge-needed
@@ -796,6 +782,8 @@ jobs:
 
       - name: Clone Git repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Update APT config
         env:

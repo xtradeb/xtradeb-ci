@@ -46,7 +46,9 @@ while (<>)
 		$value =~ s/[\t ]+/ /g;
 		$value =~ s/^ +| +$//g;
 
-		if ($sep eq "comma")
+		if (!defined($sep))
+		{ }
+		elsif ($sep eq "comma")
 		{
 			$value =~ s/,$//;
 			$value =~ s/, */\n/g;
