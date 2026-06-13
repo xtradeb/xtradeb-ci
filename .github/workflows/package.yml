@@ -16,7 +16,7 @@ on:
     inputs:
       source:
         type: string
-        description: Package source URL (.dsc/.git)
+        description: Package source (.dsc/.git/artifact)
         required: true
       max-time:
         type: number
@@ -134,6 +134,13 @@ jobs:
             https://salsa.debian.org/xtradeb-team/*.git) ;;
             https://salsa.debian.org/iskunk/*.git) ;;
             https://salsa.debian.org/joliveira/*.git) ;;
+            artifact:*/*)
+            if ! grep -Pqx 'artifact:\d{6,12}/\w+[-\w]{0,32}' <<< $ARG_SOURCE
+            then
+              echo 'error: invalid artifact identifier'
+              exit 1
+            fi
+            ;;
             *) echo "error: not an allowed source URL: $ARG_SOURCE"; exit 1 ;;
           esac
           cn_list=$(tr -d '\r' <<< $CODENAME_LIST)
@@ -148,13 +155,16 @@ jobs:
           echo ' '; echo 'Validated arguments:'
           env | awk -v FS== '/^ARG_/ {print $1 ": " $2 }' | sort
 
-      - name: Examine source URL
+      - name: Examine source
         id: info
+        env:
+          GH_TOKEN: ${{github.token}}
         run: |
           exec 2>&1
           case "$ARG_SOURCE" in
             *.dsc) ################
             source_type=dsc
+            unset GH_TOKEN
             dsc_file=${ARG_SOURCE##*/}
             echo "DSC file: $dsc_file"
             # Note: .dsc filename must have package + version info
@@ -170,6 +180,7 @@ jobs:
             ;;
             *.git) ################
             source_type=git
+            unset GH_TOKEN
             dch=/tmp/git-changelog.txt
             for branch in debian/latest main
             do
@@ -188,7 +199,66 @@ jobs:
           Version: \`$version\`
           END
             ;;
-          esac
+            artifact:*) ################
+            source_type=artifact
+            art_run_id=$(sed 's/.*://; s!/.*!!' <<< $ARG_SOURCE)
+            art_name=${ARG_SOURCE#*/}
+            echo "Artifact workflow run ID: $art_run_id"
+            echo "Artifact name: $art_name"
+            art_run_url=https://github.com/$GITHUB_REPOSITORY/actions/runs/$art_run_id
+            echo "Workflow run URL: $art_run_url"
+            echo ' '
+            (set -x; gh run download $art_run_id -n $art_name -D artifact)
+            if [ ! -f artifact/INFO ]
+            then
+              echo 'error: artifact does not contain INFO file'
+              exit 1
+            fi
+            echo ' '
+            package_regex='[0-9a-z][-.0-9a-z]{,64}'
+            version_regex='\w[-+.\w:~]{,64}'
+            base_package=$(misc/deb822-field.pl \
+              --validate-regex="$package_regex" \
+              Transform-Base-Source \
+              artifact/INFO)
+            base_version=$(misc/deb822-field.pl \
+              --validate-regex="$version_regex" \
+              Transform-Base-Version \
+              artifact/INFO)
+            package=$(misc/deb822-field.pl \
+              --validate-regex="$package_regex" \
+              Source \
+              artifact/INFO)
+            version=$(misc/deb822-field.pl \
+              --validate-regex="$version_regex" \
+              Version \
+              artifact/INFO)
+            upstream_version=${version%-*}
+            if [ -n "$base_package" ]
+            then
+              base_upstream_version=${base_version%-*}
+              cache_key=orig_${base_package}_$base_upstream_version
+            else
+              cache_key=orig_${package}_$upstream_version
+            fi
+            cat >> $GITHUB_STEP_SUMMARY << END
+          Artifact: \`$art_name\` ([workflow run]($art_run_url))
+          Package: \`$package\`
+          Version: \`$version\`
+          END
+            if [ -n "$base_package" ]
+            then
+              echo "Base package: \`$base_package\`" >> $GITHUB_STEP_SUMMARY
+              test "_$base_version" = "_$version" \
+              || echo "Base version: \`$base_version\`" >> $GITHUB_STEP_SUMMARY
+              cat >> $GITHUB_OUTPUT << END
+          base-package=$base_package
+          base-version=$base_version
+          base-upstream-version=$base_upstream_version
+          END
+            fi
+            ;;
+          esac ################
           echo >> $GITHUB_STEP_SUMMARY
           cat << END
           Package: $package
@@ -422,6 +492,64 @@ jobs:
           (cd source && set -x && dpkg-source --skip-patches --extract *.dsc)
           echo ' '
           (set -x; dpkg-parsechangelog -l source/*/debian/changelog -c 1)
+          echo ' '
+          check_changelog_version source/*/debian/changelog $PACKAGE $VERSION
+
+      - name: Unpack source package artifact
+        if: steps.info.outputs.source-type == 'artifact'
+        id: unpack-artifact
+        env:
+          PACKAGE: ${{steps.info.outputs.package}}
+          VERSION: ${{steps.info.outputs.version}}
+          UPSTREAM_VERSION: ${{steps.info.outputs.upstream-version}}
+          BASE_PACKAGE: ${{steps.info.outputs.base-package}}
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          mkdir source
+          if [ -f orig/.cached ]
+          then
+            # Use cached orig source tarball(s), but only the ones we need
+            # (per the INFO file), and be mindful of renames
+            awk '/^\s+[0-9a-f]{64} [0-9]+ \S+$/ && /\.orig[-.]/ { print $3 }' artifact/INFO > orig-list.txt
+            for orig in $(cd orig && echo *.orig*)
+            do
+              test -f orig/$orig || continue
+              orig_dest=$orig
+              test -z "$BASE_PACKAGE" \
+              || orig_dest=${PACKAGE}_${UPSTREAM_VERSION}.orig${orig##*.orig}
+              grep -Fqx $orig_dest orig-list.txt || continue
+              ln -sv ../orig/$orig source/$orig_dest
+            done
+          fi
+          for srcpkg_file in $(cd artifact && echo ${PACKAGE}_*)
+          do
+            test -f artifact/$srcpkg_file || continue
+            rm -f source/$srcpkg_file
+            ln -sv ../artifact/$srcpkg_file source/
+          done
+          echo ' '
+          if [ -n "$ARG_SOURCE_HASH" ]
+          then
+            hash=$(cat source/*.dsc | sha256sum | awk '{ print "sha256:" $1 }')
+            if [ "_$hash" = "_$ARG_SOURCE_HASH" ]
+            then
+              echo 'Source .dsc file matches provided hash.'
+              echo ' '
+            else
+              echo 'Error: Source .dsc file DOES NOT match provided hash!'
+              echo "Errant hash: $hash"
+              exit 1
+            fi
+          fi
+          ls -Ll source
+          echo ' '
+          echo 'SHA-256 sums:'
+          (cd source && sha256sum *)
+          echo ' '
+          (cd source && set -x && dpkg-source --skip-patches --extract *.dsc)
+          echo ' '
+          (set -x; dpkg-parsechangelog -l source/*/debian/changelog -c1)
           echo ' '
           check_changelog_version source/*/debian/changelog $PACKAGE $VERSION
 
