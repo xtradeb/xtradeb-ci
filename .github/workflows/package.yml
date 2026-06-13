@@ -562,6 +562,51 @@ jobs:
           key: ${{steps.info.outputs.cache-key}}
           path: orig
 
+      - name: Generate vendor-source orig tarball if needed
+        if: steps.info.outputs.source-type == 'dsc'
+        id: vendor
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          cd source
+          srcpkg_dir=$(dirname $(echo */debian))
+          mkdir vendor.tmp
+          cp -al $srcpkg_dir vendor.tmp/
+          rm -rf vendor.tmp/$srcpkg_dir/debian
+          cp -a $srcpkg_dir/debian vendor.tmp/$srcpkg_dir/
+          export SECURE_WRAP_RW_DIRS=vendor.tmp/$srcpkg_dir/debian
+          secure_wrap ../xtradeb-convert/convert.sh vendor.tmp/$srcpkg_dir/debian VENDOR
+          echo ' '
+          if grep -q '^make-vendor-source:' vendor.tmp/$srcpkg_dir/debian/rules
+          then
+            vendor_depends=$(../misc/deb822-field.pl \
+              --comma-sep \
+              --validate-regex='[a-z][-.0-9a-z]{,63}' \
+              XS-XtraDeb-Vendor-Source-Depends \
+              vendor.tmp/$srcpkg_dir/debian/control)
+            if [ -n "$vendor_depends" ]
+            then
+              echo '::group::Install dependencies required to generate the tarball'
+              apt_get_install $vendor_depends
+              echo '::endgroup::'; echo ' '
+            fi
+            export SECURE_WRAP_RW_DIRS=$PWD/vendor.tmp
+            export CARGO_HOME=/tmp
+            echo 'Generating vendor-source tarball:'
+            # Note: We set PATH to use only distro-provided tools
+            (cd vendor.tmp/$srcpkg_dir \
+             && PATH=/usr/bin SECURE_WRAP_ALLOW_NETWORK=yes \
+                secure_wrap debian/rules make-vendor-source)
+            mv vendor.tmp/*.orig-vendor.tar.xz .
+            echo ' '
+            echo 'SHA-256 sum:'
+            sha256sum *.orig-vendor.tar.xz
+            echo generated=true >> $GITHUB_OUTPUT
+          else
+            echo 'Vendoring is not applicable to this package.'
+          fi
+          rm -rf vendor.tmp
+
       - name: Check which Ubuntu releases already have this package version (or newer)
         if: ${{! inputs.subset-release}}
         env:
@@ -594,6 +639,7 @@ jobs:
         env:
           PACKAGE: ${{steps.info.outputs.package}}
           VERSION: ${{steps.info.outputs.version}}
+          VENDOR_GENERATED: ${{steps.vendor.outputs.generated}}
         run: |
           exec 2>&1
           . misc/functions.sh
@@ -645,12 +691,15 @@ jobs:
                   auto)
                   # Typically, only the first upload needs orig source...
                   orig_src_opt=$(grep -Pq 'xtradeb1\.\d{4}\.1$' <<< $dch_ver_noepoch && echo a || echo d)
-                  # ...unless we're pulling from the Ubuntu primary
-                  # archive, in which case no orig source is needed
-                  case $ARG_SOURCE in
-                    */ppa.launchpadcontent.net/*) ;;
-                    */ubuntu/pool/*) orig_src_opt=d ;;
-                  esac
+                  if [ -z "$VENDOR_GENERATED" ]
+                  then
+                    # ...unless we're pulling from the Ubuntu primary
+                    # archive, in which case no orig source is needed
+                    case $ARG_SOURCE in
+                      */ppa.launchpadcontent.net/*) ;;
+                      */ubuntu/pool/*) orig_src_opt=d ;;
+                    esac
+                  fi
                   ;;
                   yes) orig_src_opt=a ;;
                   no)  orig_src_opt=d ;;
