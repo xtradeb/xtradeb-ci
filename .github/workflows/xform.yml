@@ -1,0 +1,201 @@
+---
+name: Transform source package
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        type: string
+      version:
+        type: string
+      source-archive:
+        type: string
+  workflow_dispatch:
+    inputs:
+      package:
+        type: choice
+        options:
+          - none
+          - betterbird
+          - helium-browser
+          - zen-browser
+          - ungoogled-chromium
+        required: true
+        description: Transformed package
+      version:
+        type: string
+        required: true
+        description: Base package version
+      source-archive:
+        type: choice
+        options:
+          - debian-unstable
+          - debian-stable
+          - debian-incoming
+          - ubuntu-devel
+        required: true
+        description: Download base package from
+
+run-name: "${{inputs.package}} \U00002190 ${{inputs.version}}"
+
+env:
+  DEBIAN_INCOMING: https://incoming.debian.org/debian-buildd
+  DEBIAN_MIRROR: http://debian-archive.trafficmanager.net/debian
+  UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+
+jobs:
+
+  xform:
+    runs-on: ubuntu-26.04
+    env:
+      ARG_PACKAGE: ${{inputs.package}}
+      ARG_VERSION: ${{inputs.version}}
+      ARG_SOURCE_ARCHIVE: ${{inputs.source-archive}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow arguments
+        run: |
+          exec 2>&1
+          perl -T -C0 \
+            -e '$| = 1; $c = qr/[a-z]{2,12}/; $p = qr/[0-9a-z][-0-9a-z.]{1,64}/; $s = qr/ {1,2}/;' \
+            -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^($r)$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
+            -e 'chk("ARG_PACKAGE", qr/\w[-.\w]{,64}/, "package");' \
+            -e 'chk("ARG_VERSION", qr/.{,128}/, "version");' \
+            -e 'chk("ARG_SOURCE_ARCHIVE", qr/debian-(incoming|(un)?stable)|ubuntu-devel/, "source archive");'
+          if [ ! -f "xform/$ARG_PACKAGE.sh" ]
+          then
+            echo "error: unrecognized package \"$ARG_PACKAGE\""
+            exit 1
+          fi
+          echo ' '; echo 'Validated arguments:'
+          env | awk -v FS== '/^ARG_/ {print $1 ": " $2 }' | sort
+
+      - name: Get package details
+        id: info
+        run: |
+          exec 2>&1
+          base_source=$(sed -nr 's/^(# *)?Transform-Base-Source: *// p' xform/$ARG_PACKAGE.sh | head -n1)
+          if ! grep -Pqx '\w[-.\w]{0,64}' <<< $base_source
+          then
+            echo 'error: no valid value of Transform-Base-Source found in script'
+            exit 1
+          fi
+          upstream_version=${ARG_VERSION%-*}
+          cache_key=orig_${base_source}_$upstream_version
+          cat << END
+          Base source: $base_source
+          Version (package): $ARG_VERSION
+          Version (upstream): $upstream_version
+          Cache key: $cache_key
+          END
+          cat >> $GITHUB_OUTPUT << END
+          base-source=$base_source
+          cache-key=$cache_key
+          END
+
+      - name: Restore orig source cache if present
+        id: restore-cache
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{steps.info.outputs.cache-key}}
+          path: orig
+          fail-on-cache-miss: ${{inputs.source-archive == 'debian-incoming'}}
+
+      - name: Avoid delays from php*-fpm
+        run: |
+          if ! echo /usr/lib/systemd/system/php*-fpm.service | grep -Fq '*'
+          then
+            (set -x; sudo apt-get --purge remove 'php*-fpm')
+          fi
+
+      - name: Install required packages
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          apt_get_install \
+            bubblewrap \
+            debhelper \
+            debian-archive-keyring \
+            debian-keyring \
+            devscripts \
+            quilt
+
+      - name: Check for working bubblewrap
+        run: |
+          exec 2>&1; set -x
+          #sudo apparmor_parser /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --ro-bind / / true
+
+      - name: Patch dpkg to speed up source package builds
+        run: (cd / && sudo patch -p1) < misc/dpkg-source-build.patch 2>&1
+
+      - name: Set up source archive
+        run: |
+          exec 2>&1
+          case $ARG_SOURCE_ARCHIVE in
+            debian-incoming) args="$DEBIAN_INCOMING buildd-unstable main" ;;
+            debian-stable)   args="$DEBIAN_MIRROR stable main" ;;
+            debian-unstable) args="$DEBIAN_MIRROR unstable main" ;;
+            ubuntu-devel)    args="$UBUNTU_MIRROR devel main universe" ;;
+          esac
+          set -x
+          chdist create source-archive $args
+          sed -i '/^deb / s/^/##/' ~/.chdist/source-archive/etc/apt/sources.list
+          chdist apt-get source-archive update
+
+      - name: Perform transformation
+        env:
+          APT_GET: chdist apt-get source-archive
+          DPKG_SOURCE: dpkg-source --no-generate-diff --no-preparation --abort-on-upstream-changes
+        run: |
+          exec 2>&1
+          mkdir -p work/source
+          if [ -f orig/.cached ]
+          then
+            # Use cached orig source tarball(s)
+            ln -sv ../../orig/*.orig* work/source/
+          fi
+          set -x
+          cd work
+          ../xform/$ARG_PACKAGE.sh $ARG_VERSION
+
+      - name: Delete redundant output files
+        run: |
+          exec 2>&1; set -x
+          # Redundant files are symlinked to the ones under orig/
+          find work/output -type l -exec rm -v {} +
+
+      - name: Save transformed source package files
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: xform-output
+          compression-level: 9
+          path: |
+            work/output/INFO
+            work/output/*.*
+
+      - name: Produce output summary
+        env:
+          GH_ID: ${{steps.upload.outputs.artifact-id}}
+        run: |
+          package=$(sed -n 's/^Source: *//  p' work/output/INFO)
+          version=$(sed -n 's/^Version: *// p' work/output/INFO)
+          xd_id=artifact:$GITHUB_RUN_ID/xform-output
+          echo "GitHub artifact ID: $GH_ID"
+          echo "XtraDeb ID: $xd_id"
+          sed 's/^\.$/ /' << END >> $GITHUB_STEP_SUMMARY
+          Package: \`$package\`
+          Version: \`$version\`
+          GitHub artifact ID: \`$GH_ID\`
+          .
+          ### XtraDeb artifact ID:
+              $xd_id
+          END
+
+# end xform.yml
