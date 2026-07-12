@@ -44,7 +44,9 @@ on:
         description: "\U0001F527 XtraDeb version minor"
       include-source:
         type: choice
-        options: [auto, yes, no]
+        # Note: These need to be quoted, or else the latter two options
+        # are interpreted as boolean literals
+        options: ["auto", "yes", "no"]
         description: "\U0001F527 Include source in first upload?"
       run-name:
         # Workaround to the inability to change the title of the workflow
@@ -66,10 +68,12 @@ env:
   DEBFULLNAME: ${{vars.DEBFULLNAME}}
   DEBEMAIL: ${{vars.DEBEMAIL}}
 
+permissions: {}
+
 jobs:
 
   prep-source:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       ARG_SOURCE: ${{inputs.source}}
       ARG_MAX_TIME: ${{inputs.max-time}}
@@ -125,7 +129,7 @@ jobs:
             $MAIN_UBUNTU_MIRROR/*/*.dsc) ;;
             $DEBIAN_MIRROR/*/*.dsc) ;;
             https://deb.debian.org/debian/*/*.dsc) ;;
-            https://incoming.debian.org/debian-buildd/*/.dsc) ;;
+            https://incoming.debian.org/debian-buildd/*/*.dsc) ;;
             https://mirrors.wikimedia.org/debian/*/*.dsc) ;;
             https://mirrors.wikimedia.org/ubuntu/*/*.dsc) ;;
             https://launchpad.net/*/*.dsc) ;;
@@ -314,7 +318,6 @@ jobs:
           exec 2>&1
           . misc/functions.sh
           apt_get_install \
-            apparmor-profiles \
             bubblewrap \
             cdbs \
             debian-archive-keyring \
@@ -340,10 +343,10 @@ jobs:
           # (see https://wiki.debian.org/tag2upload)
           tee ~/.devscripts <<< DSCVERIFY_KEYRINGS=/usr/share/keyrings/debian-tag2upload.pgp
 
-      - name: Set up bubblewrap
+      - name: Check for working bubblewrap
         run: |
           exec 2>&1; set -x
-          sudo apparmor_parser /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          #sudo apparmor_parser /etc/apparmor.d/bwrap-userns-restrict
           bwrap --ro-bind / / true
 
       - name: Patch dpkg to speed up source package builds
@@ -467,9 +470,9 @@ jobs:
             echo ' '
             if [ -f git-work/git-repo/debian/gbp.conf ]
             then
-              (set -x; cd git-work/git-repo && secure_wrap gbp buildpackage -S -d -nc -uc -us)
+              (cd git-work/git-repo && secure_wrap gbp buildpackage -S -d -nc -uc -us)
             else
-              (set -x; cd git-work/git-repo && secure_wrap dpkg-buildpackage -S -d -nc -uc -us)
+              (cd git-work/git-repo && secure_wrap dpkg-buildpackage -S -d -nc -uc -us)
             fi
             mkdir orig
             for srcpkg_file in \
@@ -577,7 +580,7 @@ jobs:
           export SECURE_WRAP_RW_DIRS=vendor.tmp/$srcpkg_dir/debian
           secure_wrap ../xtradeb-convert/convert.sh vendor.tmp/$srcpkg_dir/debian VENDOR
           echo ' '
-          if grep -q '^make-vendor-source:' vendor.tmp/$srcpkg_dir/debian/rules
+          if [ -f vendor.tmp/$srcpkg_dir/debian/xtradeb-vendor.mk ]
           then
             vendor_depends=$(../misc/deb822-field.pl \
               --comma-sep \
@@ -596,7 +599,7 @@ jobs:
             # Note: We set PATH to use only distro-provided tools
             (cd vendor.tmp/$srcpkg_dir \
              && PATH=/usr/bin SECURE_WRAP_ALLOW_NETWORK=yes \
-                secure_wrap debian/rules make-vendor-source)
+                secure_wrap debian/rules vendor-tarball)
             mv vendor.tmp/*.orig-vendor.tar.xz .
             echo ' '
             echo 'SHA-256 sum:'
@@ -671,7 +674,7 @@ jobs:
             case $ret in
               0)
               echo ' '
-              if [ -s $srcpkg_dir/debian/patches/series ]
+              if grep -v '^\s*#' $srcpkg_dir/debian/patches/series | grep -q '\S'
               then
                 # Verify that the patch series applies
                 (set -x; cd $srcpkg_dir && QUILT_PATCHES=debian/patches quilt push -aq --fuzz=0 && quilt pop -afq)
@@ -728,7 +731,7 @@ jobs:
             exit 1
           fi
           # E.g. test_matrix = ["jammy","noble"]
-          test_matrix=$(jq -Rn --indent 0 '[ inputs ]' test-matrix.txt)
+          test_matrix=$(jq -Rn --indent 0 '[ inputs ]' test-matrix.txt | tr '\n' ' ')
           echo "test-matrix=$test_matrix" >> $GITHUB_OUTPUT
           echo ' '
           echo 'SHA-256 sums:'
@@ -760,7 +763,7 @@ jobs:
 
   test-build:
     needs: [prep-source]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -915,7 +918,8 @@ jobs:
           cd source/*/debian/..
           (set -x; pwd)
           ret=0
-          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT nice -19 dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
+          # Note: The "--" after "choom" is needed on jammy and noble
+          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT choom -n 1000 -- dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
           sleep 5
           echo ================================================================
           case $ret in
@@ -954,7 +958,10 @@ jobs:
   upload:
     needs: [prep-source, test-build]
     if: inputs.ppa != 'no-upload'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+    env:
+      ARG_PPA: ${{inputs.ppa}}
+      PATH: /usr/bin:/bin
     steps:
 
       - name: Clone Git repository
@@ -988,10 +995,32 @@ jobs:
           name: source-packages
           path: source
 
+      - name: Check for previous upload(s)
+        if: github.run_attempt >= 2
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          cd source
+          for changes_file in *.changes
+          do
+            package=$(sed -n 's/^Source: *// p' $changes_file)
+            dch_version=$(sed -n 's/^Version: *// p' $changes_file)
+            dsc_file=$(awk '/^ [0-9a-f]{64} [0-9]+ \S+\.dsc$/ {print $3}' $changes_file)
+            dsc_url="https://launchpad.net/~xtradeb/+archive/ubuntu/$ARG_PPA/+sourcefiles/$package/$dch_version/$dsc_file"
+            if curl --head --fail --max-time 10 --silent "$dsc_url" >/dev/null
+            then
+              echo "Already in xtradeb/$ARG_PPA: $package $dch_version"
+              # Remove the entry from the to-upload list
+              grep -Fvx "$changes_file" changes-files.txt > tmp.txt || true
+              cat tmp.txt > changes-files.txt
+              rm tmp.txt
+            fi
+          done
+          test -s changes-files.txt || error 'No packages left to upload!'
+
       - name: Sign source packages
         env:
           GPG_SIGNING_KEY: ${{secrets.GPG_SIGNING_KEY}}
-          PATH: /usr/bin:/bin
         run: |
           rm -rf ~/.gnupg
           (set -x; gpg --import <<< $GPG_SIGNING_KEY)
@@ -1003,9 +1032,7 @@ jobs:
 
       - name: Upload source packages to Launchpad (~xtradeb/${{inputs.ppa}})
         env:
-          ARG_PPA: ${{inputs.ppa}}
           SSH_UPLOAD_KEY: ${{secrets.SSH_UPLOAD_KEY}}
-          PATH: /usr/bin:/bin
         run: |
           mkdir ~/.ssh
           (umask 077; echo "$SSH_UPLOAD_KEY" > ~/.ssh/id_ed25519)

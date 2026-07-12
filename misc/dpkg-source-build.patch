@@ -4,8 +4,7 @@ project, but discussion on it remains unresolved:
 
     https://lists.debian.org/debian-dpkg/2023/09/msg00013.html
 
-This patch specifically targets the version of dpkg in Ubuntu 24.04, and
-will also apply (with some offsets) to the one in 22.04.
+This patch specifically targets the version of dpkg in Ubuntu 26.04.
 
 --- /usr/share/perl5/Dpkg/Source/Package/V2.pm.orig
 +++ /usr/share/perl5/Dpkg/Source/Package/V2.pm
@@ -38,16 +37,16 @@ will also apply (with some offsets) to the one in 22.04.
      } elsif ($opt eq '--abort-on-upstream-changes') {
          $self->{options}{auto_commit} = 0;
          return 1;
-@@ -460,6 +468,8 @@
+@@ -492,6 +500,8 @@
          }
      }
  
 +    return if !$opts{do_diff};
 +
-     # Unpack a second copy for comparison
-     my $tmp = tempdir("$dirname.orig.XXXXXX", DIR => $updir);
-     push_exit_handler(sub { erasedir($tmp) });
-@@ -530,6 +540,21 @@
+     # Unpack a second copy for comparison.
+     my $tmpdir = File::Temp->newdir(
+         TEMPLATE => "$dirname.orig.XXXXXX",
+@@ -584,6 +594,21 @@
          usageerr(g_("-b takes only one parameter with format '%s'"),
                   $self->{fields}{'Format'});
      }
@@ -69,18 +68,19 @@ will also apply (with some offsets) to the one in 22.04.
      $self->prepare_build($dir);
  
      my $include_binaries = $self->{options}{include_binaries};
-@@ -569,8 +594,9 @@
-                                         header_from => $autopatch,
-                                         handle_binary => $handle_binary,
-                                         skip_auto => $self->{options}{auto_commit},
-+                                        do_diff => $self->{options}{generate_diff},
-                                         usage => 'build');
+@@ -624,9 +649,10 @@
+         header_from => $autopatch,
+         handle_binary => $handle_binary,
+         skip_auto => $self->{options}{auto_commit},
++        do_diff => $self->{options}{generate_diff},
+         usage => 'build',
+     );
 -    unless (-z $tmpdiff or $self->{options}{auto_commit}) {
 +    unless (!$tmpdiff or -z $tmpdiff or $self->{options}{auto_commit}) {
-         info(g_('Hint: make sure the version in debian/changelog matches ' .
+         hint(g_('make sure the version in debian/changelog matches ' .
                  'the unpacked source tree'));
-         info(g_('you can integrate the local changes with %s'),
-@@ -578,7 +604,7 @@
+         hint(g_('you can integrate the local changes with %s'),
+@@ -634,7 +660,7 @@
          error(g_('aborting due to unexpected upstream changes, see %s'),
                $tmpdiff);
      }
@@ -88,13 +88,13 @@ will also apply (with some offsets) to the one in 22.04.
 +    push_exit_handler(sub { !$tmpdiff or unlink($tmpdiff) });
      $binaryfiles->update_debian_source_include_binaries() if $include_binaries;
  
-     # Install the diff as the new autopatch
-@@ -590,7 +616,7 @@
-              $autopatch) if -e $autopatch;
-         rmdir(File::Spec->catdir($dir, 'debian', 'patches')); # No check on purpose
+     # Install the diff as the new autopatch.
+@@ -647,7 +673,7 @@
+         # No check when removing directory on purpose.
+         rmdir(File::Spec->catdir($dir, 'debian', 'patches'));
      }
 -    unlink($tmpdiff) or syserr(g_('cannot remove %s'), $tmpdiff);
 +    !$tmpdiff or unlink($tmpdiff) or syserr(g_('cannot remove %s'), $tmpdiff);
      pop_exit_handler();
  
-     # Create the debian.tar
+     # Create the "debian.tar".
