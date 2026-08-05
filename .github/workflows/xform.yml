@@ -42,6 +42,7 @@ env:
   DEBIAN_INCOMING: https://incoming.debian.org/debian-buildd
   DEBIAN_MIRROR: http://debian-archive.trafficmanager.net/debian
   UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+  DPKG_SOURCE: dpkg-source --no-generate-diff --no-preparation --abort-on-upstream-changes
 
 jobs:
 
@@ -97,6 +98,10 @@ jobs:
           base-source=$base_source
           cache-key=$cache_key
           END
+          if grep -Eiq '^(# *)?Requires-System-Setup: *yes\b' xform/$ARG_PACKAGE.sh
+          then
+            echo requires-system-setup=true >> $GITHUB_OUTPUT
+          fi
 
       - name: Restore orig source cache if present
         id: restore-cache
@@ -148,21 +153,59 @@ jobs:
           sed -i '/^deb / s/^/##/' ~/.chdist/source-archive/etc/apt/sources.list
           chdist apt-get source-archive update
 
-      - name: Perform transformation
+      - name: Download and unpack source package
         env:
-          APT_GET: chdist apt-get source-archive
-          DPKG_SOURCE: dpkg-source --no-generate-diff --no-preparation --abort-on-upstream-changes
+          BASE_SOURCE: ${{steps.info.outputs.base-source}}
         run: |
           exec 2>&1
-          mkdir -p work/source
-          if [ -f orig/.cached ]
+          . misc/functions.sh
+          mkdir work work/source
+          cd work/source
+          if [ -f ../../orig/.cached ]
           then
             # Use cached orig source tarball(s)
-            ln -sv ../../orig/*.orig* work/source/
+            ln -sv ../../orig/*.orig* .
           fi
-          set -x
+          run_cmd chdist apt-get source-archive --download-only source $BASE_SOURCE=$ARG_VERSION
+          echo ' '
+          run_cmd dscverify --verbose *.dsc
+          echo ' '
+          run_cmd dpkg-source --skip-patches --extract *.dsc
+
+      - name: Cut off sudo access
+        run: sudo rm -v /etc/sudoers
+
+      - name: Perform transformation
+        if: ${{! steps.info.outputs.requires-system-setup}}
+        run: |
+          exec 2>&1; set -x
           cd work
-          ../xform/$ARG_PACKAGE.sh $ARG_VERSION
+          ../xform/$ARG_PACKAGE.sh
+
+      # This cannot be passed directly via .with.args of the next step
+      - name: Prepare container script
+        if: steps.info.outputs.requires-system-setup
+        shell: cp {0} docker-run.sh
+        run: |
+          # This will run inside the container
+          exec 2>&1; set -e
+          . misc/functions.sh
+          section 'Container initialization'
+          export APT_MIRROR=$DEBIAN_MIRROR
+          export REG_UID=1001
+          run_cmd xform/_container-init.sh
+          echo ' '
+          (cd / && run_cmd patch -p1) < misc/dpkg-source-build.patch
+          section ''
+          cd work
+          DEBEMAIL='root@example.org' run_cmd ../xform/$ARG_PACKAGE.sh --setup
+          run_as_user ../xform/$ARG_PACKAGE.sh
+
+      - name: Perform transformation (inside container)
+        if: steps.info.outputs.requires-system-setup
+        uses: docker://debian:testing
+        with:
+          args: bash docker-run.sh
 
       - name: Delete redundant output files
         run: |

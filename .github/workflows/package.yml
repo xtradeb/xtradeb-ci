@@ -196,6 +196,7 @@ jobs:
             package=$(dpkg-parsechangelog -l $dch -S Source)
             version=$(dpkg-parsechangelog -l $dch -S Version)
             upstream_version=${version%-*}
+            # TODO: Include Git hash in cache key
             cache_key=git_${package}_$version
             cat >> $GITHUB_STEP_SUMMARY << END
           Git package repo: [link]($ARG_SOURCE)
@@ -839,7 +840,7 @@ jobs:
           exec 2>&1
           . misc/functions.sh
           run_as_user
-          chown -R build:users source
+          chown -R tux:users source
 
       - name: Unpack appropriate source package
         run: |
@@ -919,7 +920,7 @@ jobs:
           (set -x; pwd)
           ret=0
           # Note: The "--" after "choom" is needed on jammy and noble
-          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT choom -n 1000 -- dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
+          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT choom -n 1000 -- unshare -cn dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
           sleep 5
           echo ================================================================
           case $ret in

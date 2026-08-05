@@ -27,6 +27,8 @@ run_cmd()
 	|| error "command exited with status $ret"
 }
 
+export DEBIAN_FRONTEND=noninteractive
+
 apt_get_install()
 {
 	local sudo=$(test $(id -u) -eq 0 || echo sudo)
@@ -57,14 +59,14 @@ END
 		shift
 	fi
 
-	if ! run_cmd --may-fail $sudo apt-get -y --no-install-recommends install "$@"
+	if ! run_cmd --may-fail $sudo apt-get -y install "$@"
 	then
 		# If the initial install fails, then we presume that the
 		# package index is stale and needs updating.
 		echo ' '
 		run_cmd $sudo apt-get --error-on=any update
 		echo ' '
-		run_cmd $sudo apt-get -y --no-install-recommends install "$@"
+		run_cmd $sudo apt-get -y install "$@"
 	fi
 }
 
@@ -157,7 +159,7 @@ purge_runner()
 # doesn't already exist)
 run_as_user()
 {
-	local user=build
+	local user=tux
 
 	if [ $(id -u) -ne 0 ]
 	then
@@ -168,8 +170,8 @@ run_as_user()
 	if ! grep -q "^$user:" /etc/passwd
 	then
 		run_cmd useradd \
-			--comment 'Build User' \
-			--gid users \
+			--comment 'Tux the Penguin' \
+			--no-user-group \
 			--create-home \
 			$user
 	fi
@@ -178,7 +180,7 @@ run_as_user()
 
 	setpriv \
 		--reuid=$user \
-		--regid=users \
+		--regid=$(id -g $user) \
 		--init-groups \
 		--no-new-privs \
 		--reset-env \
@@ -245,6 +247,25 @@ secure_wrap()
 	done
 
 	echo + "$@" >&2
+
+	if bwrap --bind / / true 2>/dev/null
+	then
+		true	# all good
+	#
+	elif [ ! -e /.dockerenv -o -e /dev/kmsg ]
+	then
+		# Not running in a container, or running
+		# inside a --privileged container
+		bwrap --bind / / true || true
+		error 'cannot use bubblewrap'
+		exit 1
+	else
+		# Running inside an unprivileged container:
+		# allow the command, for lack of a better option
+		echo "::notice file=misc/functions.sh,line=$LINENO,title=Sandboxing failure::secure_wrap() was unable to use bubblewrap inside an unprivileged container." >&2
+		"$@"
+		return
+	fi
 
 	bwrap \
 		--ro-bind / / \

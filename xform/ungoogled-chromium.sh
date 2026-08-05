@@ -1,13 +1,8 @@
 #!/bin/bash
 # ungoogled-chromium.sh
-
-chromium_deb_version=$1
-
-if [ -z "$chromium_deb_version" ]
-then
-	echo "usage: $0 CHROMIUM_DEB_VERSION"
-	exit 1
-fi
+#
+# Requires-System-Setup: yes
+#
 
 set -eu
 
@@ -15,8 +10,59 @@ top_dir=$(cd $(dirname $0) && cd .. && pwd)
 . $top_dir/misc/functions.sh
 
 base_dir=$PWD
-orig_version=${chromium_deb_version%-*}
 xtradeb_ci_commit=$(get_git_commit_id $top_dir)
+
+##
+section 'Examine Chromium source'
+##
+
+chromium_dir=$(cd source && echo chromium-*/debian/control | cut -d/ -f1)
+test -d source/$chromium_dir \
+|| error 'Cannot find Chromium source tree in source/chromium-*/'
+
+orig_tar_file=$(cd source && echo chromium_*.orig.tar.xz)
+test -f source/$orig_tar_file \
+|| error 'Cannot find Chromium source package .orig.tar.xz file'
+
+deb_version=$(cd source/$chromium_dir && dpkg-parsechangelog -S Version)
+orig_version=${deb_version%-*}
+
+cat << END
+Source tree: source/$chromium_dir/
+Orig source: source/$orig_tar_file
+
+ Package version: $deb_version
+Upstream version: $orig_version
+
+END
+
+if [ "_${1:-}" = _--setup ]
+then
+	test $(id -u) -eq 0 \
+	|| error 'The --setup action must run as root'
+
+	##
+	section 'Install Chromium build dependencies'
+	##
+
+	(cd /tmp && run_cmd mk-build-deps $base_dir/source/$chromium_dir/debian/control)
+	echo ' '
+	apt_get_install /tmp/chromium-build-deps_*_all.deb
+
+	##
+	section 'Install additional dependencies for init-pre-gen'
+	##
+
+	# Copied from $chromium_dir/debian/scripts/init-pre-gen.sh
+	arch_list=$(sed -n 's/^Architecture: *// p' source/$chromium_dir/debian/control | head -n1)
+	gcc_ver=$(apt-cache --no-all-versions show gcc | grep '^Depends:' | grep -Po ' gcc-\d\d ' | tr -cd 0-9)
+	pkg_list=$(for arch in $arch_list; do echo libc6-dev-$arch-cross libgcc-$gcc_ver-dev-$arch-cross; done)
+
+	apt_get_install $pkg_list
+
+	section ''
+	exit 0
+fi
 
 ##
 section 'Get ungoogled-chromium Git tree'
@@ -52,49 +98,7 @@ test -f ungoogled-chromium-debian/convert/Makefile \
 || error 'Cannot find ungoogled-chromium-debian conversion framework'
 
 ucd_commit=$(get_git_commit_id ungoogled-chromium-debian)
-
-echo ' '
-
-##
-section 'Get and unpack Chromium source'
-## (as shipped by Debian)
-##
-
-(cd source && run_cmd ${APT_GET:-apt-get} --download-only source chromium=$chromium_deb_version)
-
-dsc_file=$(cd source && echo chromium_*.dsc)
-test -f source/$dsc_file \
-|| error 'Cannot find Chromium source package .dsc file'
-
-debian_tar_file=$(cd source && echo chromium_*.debian.tar.xz)
-test -f source/$debian_tar_file \
-|| error 'Cannot find Chromium source package .debian.tar.xz file'
-
-orig_tar_file=$(cd source && echo chromium_*.orig.tar.xz)
-test -f source/$orig_tar_file \
-|| error 'Cannot find Chromium source package .orig.tar.xz file'
-
-echo ' '
-
-run_cmd dscverify --verbose source/$dsc_file
-
-echo ' '
-
-rm -rf _work
-mkdir  _work
-
-# Unpack source package
-(cd _work && run_cmd dpkg-source \
-	--no-copy \
-	--skip-patches \
-	--extract \
-	../source/$dsc_file
-)
-
-chromium_dir=$(cd _work && echo chromium-*/debian/control | cut -d/ -f1)
-
-test -d _work/$chromium_dir/chrome \
-|| error 'Cannot find unpacked Chromium source package dir'
+echo "HEAD: ${ucd_commit:0:8}"
 
 echo ' '
 
@@ -102,21 +106,24 @@ echo ' '
 section 'Transform chromium -> ungoogled-chromium'
 ##
 
-SECURE_WRAP_RW_DIRS=$base_dir/_work
+rm -rf inner-work
+mkdir  inner-work
 
-(cd _work && secure_wrap make -f ../ungoogled-chromium-debian/convert/Makefile \
+SECURE_WRAP_RW_DIRS=$base_dir/inner-work
+
+(cd inner-work && secure_wrap make -f ../ungoogled-chromium-debian/convert/Makefile \
 	check-git source-package \
 	VERSION=$orig_version \
-	ORIG_SOURCE=$chromium_dir \
+	ORIG_SOURCE=../source/$chromium_dir \
 	ORIG_TARBALL=../source/$orig_tar_file \
-	INPLACE=1 \
+	INIT_PRE_GEN=1 \
 	UNGOOGLED=../ungoogled-chromium \
 	DEBIAN_CONVERT=../ungoogled-chromium-debian/convert \
 	ADD_VERSION_SUFFIX=.$uc_rev \
 	DISTRIBUTION=
 )
 
-uc_deb_version=$(sed -n 's/^Version: *// p' _work/ungoogled-chromium_*.dsc)
+uc_deb_version=$(sed -n 's/^Version: *// p' inner-work/ungoogled-chromium_*.dsc)
 test -n "$uc_deb_version" \
 || error 'Could not determine version of new ungoogled-chromium package'
 
@@ -125,7 +132,7 @@ echo ' '
 
 rm -rf output
 mkdir output
-mv _work/ungoogled-chromium_* output/
+mv inner-work/ungoogled-chromium_* output/
 
 checksums=
 tab='	'
@@ -144,7 +151,7 @@ tee output/INFO << END
 Source: ungoogled-chromium
 Version: $uc_deb_version
 Transform-Base-Source: chromium
-Transform-Base-Version: $chromium_deb_version
+Transform-Base-Version: $deb_version
 Transform-Source-Refs:
 	xtradeb-ci@$xtradeb_ci_commit
 	ungoogled-chromium@$uc_commit # $uc_tag
