@@ -771,7 +771,8 @@ jobs:
         codename: ${{fromJSON(needs.prep-source.outputs.test-matrix)}}
     container:
       image: ubuntu:${{matrix.codename}}
-      options: -v /:/HOST
+      # SYS_ADMIN is needed for "unshare -n"
+      options: -v /:/HOST --cap-add=SYS_ADMIN
     defaults:
       run:
         shell: bash
@@ -912,6 +913,7 @@ jobs:
         id: build
         timeout-minutes: ${{fromJSON(steps.conf.outputs.max-time-plus)}}
         env:
+          RUN_AS_USER_WRAP: unshare -n
           TIMEOUT: timeout --foreground -v -k 30s ${{inputs.max-time}}m
         run: |
           exec 2>&1
@@ -920,7 +922,7 @@ jobs:
           (set -x; pwd)
           ret=0
           # Note: The "--" after "choom" is needed on jammy and noble
-          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT choom -n 1000 -- unshare -cn dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
+          run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT choom -n 1000 -- dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
           sleep 5
           echo ================================================================
           case $ret in

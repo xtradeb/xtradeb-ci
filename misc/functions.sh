@@ -178,7 +178,7 @@ run_as_user()
 
 	test -n "$*" || return 0
 
-	setpriv \
+	${RUN_AS_USER_WRAP:-} setpriv \
 		--reuid=$user \
 		--regid=$(id -g $user) \
 		--init-groups \
