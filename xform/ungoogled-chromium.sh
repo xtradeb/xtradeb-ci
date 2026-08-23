@@ -72,8 +72,6 @@ section 'Get ungoogled-chromium Git tree'
 test -d ungoogled-chromium \
 || run_cmd git clone --depth=10 https://github.com/ungoogled-software/ungoogled-chromium.git
 
-uc_commit=$(get_git_commit_id ungoogled-chromium)
-
 uc_tag=$(git -C ungoogled-chromium tag --list --sort=version:refname "$orig_version-*" | tail -n1)
 test -n "$uc_tag" || error "Cannot find matching tag for $orig_version"
 
@@ -83,6 +81,8 @@ echo ' '
 
 echo "Using ungoogled-chromium tag \"$uc_tag\""
 run_cmd git -C ungoogled-chromium switch -d $uc_tag
+
+uc_commit=$(get_git_commit_id ungoogled-chromium)
 
 echo ' '
 

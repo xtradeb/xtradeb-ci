@@ -25,6 +25,8 @@ on:
       ppa:
         type: choice
         options: [no-upload, apps, play, deps, test]
+        # Note: A default value is needed for REST API calls
+        default: no-upload
         description: Upload to this XtraDeb PPA
       source-hash:
         type: string
@@ -47,6 +49,7 @@ on:
         # Note: These need to be quoted, or else the latter two options
         # are interpreted as boolean literals
         options: ["auto", "yes", "no"]
+        default: "auto"
         description: "\U0001F527 Include source in first upload?"
       run-name:
         # Workaround to the inability to change the title of the workflow
@@ -623,6 +626,9 @@ jobs:
           awk '{ print $3 "\t" $5 }' madison.txt \
           | while read rel_ver suite_component
           do
+            case "$rel_ver" in
+              ?:1snap1-0ubuntu*) continue ;;  # ignore snap versions
+            esac
             if dpkg --compare-versions "$rel_ver" ge "$dch_upstream_version"
             then
               suite=$(sed 's![-/].*!!' <<< $suite_component)
@@ -771,8 +777,9 @@ jobs:
         codename: ${{fromJSON(needs.prep-source.outputs.test-matrix)}}
     container:
       image: ubuntu:${{matrix.codename}}
-      # SYS_ADMIN is needed for "unshare -n"
-      options: -v /:/HOST --cap-add=SYS_ADMIN
+      # {NET,SYS}_ADMIN are needed by net-wrap.sh (but all caps are dropped
+      # for the test build)
+      options: -v /:/HOST --cap-add=NET_ADMIN --cap-add=SYS_ADMIN
     defaults:
       run:
         shell: bash
@@ -826,6 +833,7 @@ jobs:
             dpkg-dev \
             equivs \
             fakeroot \
+            iproute2 \
             lintian \
             time \
             zstd
@@ -913,13 +921,13 @@ jobs:
         id: build
         timeout-minutes: ${{fromJSON(steps.conf.outputs.max-time-plus)}}
         env:
-          RUN_AS_USER_WRAP: unshare -n
           TIMEOUT: timeout --foreground -v -k 30s ${{inputs.max-time}}m
         run: |
           exec 2>&1
           . misc/functions.sh
           cd source/*/debian/..
           (set -x; pwd)
+          RUN_AS_USER_WRAP=../../misc/net-wrap.sh
           ret=0
           # Note: The "--" after "choom" is needed on jammy and noble
           run_as_user ". ../test-build-env.sh && env time -v $TIMEOUT choom -n 1000 -- dpkg-buildpackage -b --source-option=--no-unapply-patches" || ret=$?
@@ -1045,7 +1053,7 @@ jobs:
           (cd source && set -x && dput "xtradeb-$ARG_PPA" $changes_files)
           rm -r ~/.ssh
           echo ' '
-          echo 'Upload complete.'
+          echo "Upload completed at $(date --rfc-3339=sec)"
 
       - name: Save uploaded files and upload logs
         uses: actions/upload-artifact@v6
@@ -1053,6 +1061,7 @@ jobs:
           name: upload-files
           compression-level: 9
           # Note: Do not save the orig source, as we do not modify it
+          # TODO: Include orig source tarballs that we generate
           path: |
             source/*xtradeb*.dsc
             source/*xtradeb*.debian.*

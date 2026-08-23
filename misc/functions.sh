@@ -182,6 +182,7 @@ run_as_user()
 		--reuid=$user \
 		--regid=$(id -g $user) \
 		--init-groups \
+		--bounding-set -all \
 		--no-new-privs \
 		--reset-env \
 		/bin/sh -ex -c "$@"
