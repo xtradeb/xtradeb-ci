@@ -42,6 +42,8 @@ env:
   DEBIAN_INCOMING: https://incoming.debian.org/debian-buildd
   DEBIAN_MIRROR: http://debian-archive.trafficmanager.net/debian
   UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+  DEBFULLNAME: ${{vars.DEBFULLNAME}}
+  DEBEMAIL: ${{vars.DEBEMAIL}}
   DPKG_SOURCE: dpkg-source --no-generate-diff --no-preparation --abort-on-upstream-changes
 
 jobs:
