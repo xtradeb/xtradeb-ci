@@ -170,9 +170,12 @@ run_as_user()
 	if ! grep -q "^$user:" /etc/passwd
 	then
 		run_cmd useradd \
+			$(test -z "${RUN_AS_USER_USERADD_UID:-}" || echo --uid $RUN_AS_USER_USERADD_UID) \
+			$(test -n "${RUN_AS_USER_USERADD_UGROUP:-}" || echo --no-user-group) \
 			--comment 'Tux the Penguin' \
-			--no-user-group \
+			--shell /bin/bash \
 			--create-home \
+			--key HOME_MODE=0755 \
 			$user
 	fi
 
@@ -184,7 +187,7 @@ run_as_user()
 		--init-groups \
 		--bounding-set -all \
 		--no-new-privs \
-		--reset-env \
+		$(test -n "${RUN_AS_USER_NO_RESET_ENV:-}" || echo --reset-env) \
 		/bin/sh -ex -c "$@"
 }
 

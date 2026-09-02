@@ -190,16 +190,45 @@ jobs:
           # This will run inside the container
           exec 2>&1; set -e
           . misc/functions.sh
-          section 'Container initialization'
-          export APT_MIRROR=$DEBIAN_MIRROR
-          export REG_UID=1001
-          run_cmd xform/_container-init.sh
+          section 'Container initialization'  # i.e. Dockerfile equivalent
+          run_cmd perl -pi \
+            -e "s!http://deb.debian.org/debian!$DEBIAN_MIRROR!" \
+            /etc/apt/sources.list.d/*.sources
+          run_cmd apt-get --error-on=any update
+          run_cmd apt-mark hold systemd  # avoid this one
+          run_cmd apt-get -y dist-upgrade
           echo ' '
-          (cd / && run_cmd patch -p1) < misc/dpkg-source-build.patch
+          apt_get_install \
+            bubblewrap \
+            ca-certificates \
+            debhelper \
+            devscripts \
+            dpkg-dev \
+            equivs \
+            file \
+            git \
+            jq \
+            netcat-openbsd \
+            procps \
+            python3 \
+            quilt \
+            rsync \
+            time \
+            unzip \
+            wget \
+            xz-utils \
+            zip \
+            zstd
+          RUN_AS_USER_USERADD_UID=$(stat -c '%u' .git) \
+          RUN_AS_USER_USERADD_UGROUP=t \
+            run_as_user
+          echo ' '
+          run_cmd patch -d/ -p1 < misc/dpkg-source-build.patch
           section ''
           cd work
           DEBEMAIL='root@example.org' run_cmd ../xform/$ARG_PACKAGE.sh --setup
-          run_as_user ../xform/$ARG_PACKAGE.sh
+          RUN_AS_USER_NO_RESET_ENV=t \
+            run_as_user ../xform/$ARG_PACKAGE.sh
 
       - name: Perform transformation (inside container)
         if: steps.info.outputs.requires-system-setup
