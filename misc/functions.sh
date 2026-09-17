@@ -118,14 +118,14 @@ purge_runner()
 	local avail=$(df --block-size=1M --output=avail . | tail -n1)
 	if [ $avail -gt 51200 ]
 	then
-		df -m .
+		df -m . || true
 		echo ' '
 		echo "$FUNCNAME(): Skipping as more than 50 GB of disk space is available."
 		return 0
 	fi
 
 	echo 'Before:'
-	df -m .
+	df -m . || true
 
 	echo ' '
 
@@ -152,7 +152,7 @@ purge_runner()
 	echo ' '
 
 	echo 'After:'
-	df -m .
+	df -m . || true
 }
 
 # Run a command as a regular user (and create said regular user if it
