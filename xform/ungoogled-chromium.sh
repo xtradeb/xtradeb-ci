@@ -143,6 +143,7 @@ do
 	checksums+="$tab$sum $size $(basename $file)
 "
 done
+checksums=${checksums:0:-1}  # strip final newline
 
 hr='================================================================'
 echo $hr

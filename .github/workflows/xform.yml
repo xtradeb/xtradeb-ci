@@ -68,7 +68,7 @@ jobs:
             -e '$| = 1; $c = qr/[a-z]{2,12}/; $p = qr/[0-9a-z][-0-9a-z.]{1,64}/; $s = qr/ {1,2}/;' \
             -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^($r)$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
             -e 'chk("ARG_PACKAGE", qr/\w[-.\w]{,64}/, "package");' \
-            -e 'chk("ARG_VERSION", qr/.{,128}/, "version");' \
+            -e 'chk("ARG_VERSION", qr/(\d{1,2}:)?\w[-.+~\w]{,128}/, "version");' \
             -e 'chk("ARG_SOURCE_ARCHIVE", qr/debian-(incoming|(un)?stable)|ubuntu-devel/, "source archive");'
           if [ ! -f "xform/$ARG_PACKAGE.sh" ]
           then
@@ -161,6 +161,13 @@ jobs:
         run: |
           exec 2>&1
           . misc/functions.sh
+          if ! echo "$ARG_VERSION" | grep -Pq '^\d+:'
+          then
+            # All too easy to forget specifying the epoch (when applicable)
+            case "$BASE_SOURCE" in
+              thunderbird) ARG_VERSION="1:$ARG_VERSION" ;;
+            esac
+          fi
           mkdir work work/source
           cd work/source
           if [ -f ../../orig/.cached ]

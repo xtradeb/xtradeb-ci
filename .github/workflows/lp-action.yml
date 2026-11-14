@@ -20,7 +20,7 @@ on:
     inputs:
       action:
         type: choice
-        options: [retry, copy]
+        options: [retry, cancel, copy]
         default: retry
         description: Action to perform
       ppa:
@@ -60,7 +60,7 @@ jobs:
           perl -T -C0 \
             -e '$| = 1; $c = qr/[a-z]{2,12}/; $p = qr/[0-9a-z][-0-9a-z.]{1,64}/; $s = qr/ {1,2}/;' \
             -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^($r)$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
-            -e 'chk("ARG_ACTION", qr/(copy|retry)/, "action");' \
+            -e 'chk("ARG_ACTION", qr/(cancel|copy|retry)/, "action");' \
             -e 'chk("ARG_PPA", qr/(no-upload|apps|play|deps|test)/, "PPA");' \
             -e 'chk("ARG_PACKAGE", qr/$p($s$p)*/, "package(s)");' \
             -e 'chk("ARG_PACKAGE", qr/.{,128}/, "package(s)");' \
@@ -100,6 +100,20 @@ jobs:
           unset LP_CREDENTIALS
           ! grep -Pq '\r' $LP_CREDENTIALS_FILE
           case $ARG_ACTION in
+            cancel)
+            for package in $ARG_PACKAGE
+            do
+              for codename in $(tr -d '\r' <<< $CODENAME_LIST)
+              do
+                echo ' '
+                (set -x; misc/launchpad/ubuntu-build \
+                  -A ppa:xtradeb/ubuntu/$ARG_PPA \
+                  $package \
+                  $codename \
+                  cancel)
+              done
+            done
+            ;;
             copy)
             case "$ARG_ORIG_RELEASE" in
               primary-*)

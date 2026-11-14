@@ -107,7 +107,7 @@ def parse_args(argv: list[str], valid_archs: set[str]) -> argparse.Namespace:
     """Parse command line arguments and return namespace."""
     # Usage.
     usage = "%(prog)s <srcpackage> <release> <operation>\n\n"
-    usage += "Where operation may be one of: rescore, retry, retry-soft-failed, or status.\n"
+    usage += "Where operation may be one of: cancel, rescore, retry, retry-soft-failed, or status.\n"
     usage += "Only Launchpad Buildd Admins may rescore package builds."
 
     # Prepare our option parser.
@@ -126,7 +126,7 @@ def parse_args(argv: list[str], valid_archs: set[str]) -> argparse.Namespace:
 
     parser.add_argument("-n", "--dry-run", action="store_true", help="don't make any changes")
 
-    parser.add_argument("-v", "--version", help="operate on specific version of package")
+    parser.add_argument("-p", "--pkg-ver", help="operate on specific version of package")
 
     # Batch processing options
     batch_options = parser.add_argument_group(
@@ -185,7 +185,7 @@ def main():
     operation = "status"
 
     if not args.batch:
-        # Check we have the correct number of arguments.
+        # Check that we have the correct number of arguments.
         if len(args.packages) < 3:
             parser.error("Incorrect number of arguments.")
         try:
@@ -196,7 +196,7 @@ def main():
             parser.print_help()
             sys.exit(1)
         # Check our operation.
-        if operation not in ("rescore", "retry", "retry-soft-failed", "status"):
+        if operation not in ("cancel", "rescore", "retry", "retry-soft-failed", "status"):
             Logger.error("Invalid operation: %s.", operation)
             sys.exit(1)
 
@@ -215,7 +215,7 @@ def main():
             if args.archive == "ubuntu":
                 release = f"{release}-proposed"
         try:
-            (release, pocket) = split_release_pocket(release)
+            release, pocket = split_release_pocket(release)
         except PocketDoesNotExistError as error:
             Logger.error(error)
             sys.exit(1)
@@ -245,7 +245,7 @@ def main():
 
         # split release and pocket
         try:
-            (release, pocket) = split_release_pocket(release)
+            release, pocket = split_release_pocket(release)
         except PocketDoesNotExistError as error:
             Logger.error(error)
             sys.exit(1)
@@ -257,11 +257,11 @@ def main():
                 exact_match=True,
                 pocket=pocket,
                 source_name=package,
-                version=args.version if args.version else None
+                version=args.pkg_ver if args.pkg_ver else None
             )[0]
         except IndexError:
-            if args.version:
-                Logger.error("No publication found for package %s version %s", package, args.version)
+            if args.pkg_ver:
+                Logger.error("No publication found for package %s version %s", package, args.pkg_ver)
             else:
                 Logger.error("No publication found for package %s", package)
             sys.exit(1)
@@ -325,6 +325,13 @@ def main():
             ):
                 builds_in_progress = True
 
+            if operation == "cancel":
+                if build.can_be_cancelled:
+                    Logger.info("    Cancelling build on %s...", build.arch_tag)
+                    args.dry_run or build.cancel()
+                else:
+                    Logger.info("    Cannot cancel build on %s.", build.arch_tag)
+
             if operation == "rescore":
                 if build.can_be_rescored:
                     priority = args.priority or 5000
@@ -339,6 +346,7 @@ def main():
                         break
                 else:
                     Logger.info("    Cannot rescore build on %s.", build.arch_tag)
+
             if operation in ("retry", "retry-soft-failed"):
                 if build.can_be_retried:
                     if operation == "retry" or is_soft_failed(build):

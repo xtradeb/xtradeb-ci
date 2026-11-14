@@ -90,6 +90,7 @@ jobs:
       # Warning: May contain CRs
       CODENAME_LIST: ${{vars.UBUNTU_CODENAME_LIST}}
     outputs:
+      more-swap: ${{steps.convert.outputs.more-swap}}
       purge-needed: ${{steps.download-dsc.outputs.purge-needed}}
       test-matrix: ${{steps.convert.outputs.test-matrix}}
       ubuntu-mirror: ${{steps.mirror.outputs.ubuntu-mirror}}
@@ -650,6 +651,7 @@ jobs:
           PACKAGE: ${{steps.info.outputs.package}}
           VERSION: ${{steps.info.outputs.version}}
           VENDOR_GENERATED: ${{steps.vendor.outputs.generated}}
+          XTRADEB_NON_PRODUCTION: ${{(inputs.ppa == 'no-upload' || inputs.ppa == 'test') && 't'}}
         run: |
           exec 2>&1
           . misc/functions.sh
@@ -664,6 +666,7 @@ jobs:
           export XTRADEB_VERSION_MAJOR=$ARG_XD_VERSION_MAJOR
           export XTRADEB_VERSION_MINOR=$ARG_XD_VERSION_MINOR
           changelog=$srcpkg_dir/debian/changelog
+          more_swap=
           orig_src_opt=
           for codename in $(tr -d '\r' <<< $CODENAME_LIST)
           do
@@ -723,6 +726,13 @@ jobs:
               echo $codename >> test-matrix.txt
               new_dsc_file=$(ls -1t *.dsc | head -n1)
               echo $new_dsc_file > dsc-file.$codename.txt
+              if grep -Eq '^\s+xtradeb-build-hack-swap[ ,]' $srcpkg_dir/debian/control
+              then
+                echo ' '
+                echo 'Note: Converted package has xtradeb-build-hack-swap dependency.'
+                echo 'Will enable additional swap space in the test builds.'
+                more_swap=true
+              fi
               echo "| Ubuntu $codename | \`$new_dsc_file\` |" >> $GITHUB_STEP_SUMMARY
               ;;
               2) ;;  # not applicable/needed for this release
@@ -746,6 +756,7 @@ jobs:
           # Tar up xtradeb-convert to put it in an artifact
           (cd .. && tar czf xtradeb-convert.tar.gz --exclude=xtradeb-convert/.git xtradeb-convert)
           # Miscellaneous
+          echo "more-swap=$more_swap" >> $GITHUB_OUTPUT
           case "$ARG_PPA" in
             no-upload) dest_ppa='(none)' ;;
             *) dest_ppa="\`$ARG_PPA\`" ;;
@@ -778,8 +789,10 @@ jobs:
     container:
       image: ubuntu:${{matrix.codename}}
       # {NET,SYS}_ADMIN are needed by net-wrap.sh (but all caps are dropped
-      # for the test build)
-      options: -v /:/HOST --cap-add=NET_ADMIN --cap-add=SYS_ADMIN
+      # for the test build); seccomp=unconfined is needed for swapon(8)
+      options: >-
+        -v /:/HOST --cap-add=NET_ADMIN --cap-add=SYS_ADMIN
+        ${{needs.prep-source.outputs.more-swap && '--security-opt=seccomp=unconfined' || ''}}
     defaults:
       run:
         shell: bash
@@ -800,6 +813,33 @@ jobs:
           exec 2>&1
           . misc/functions.sh
           purge_runner
+
+      - name: Set up additional swap space
+        if: needs.prep-source.outputs.more-swap
+        env:
+          # This size (specified in MB) should match what
+          # is used in the xtradeb-build-hack-swap package
+          SIZE: 24576
+        run: |
+          exec 2>&1
+          . misc/functions.sh
+          umask 077
+          echo 'BEFORE:'
+          run_cmd free -mt
+          echo ' '
+          # Note: Only some writable locations are on a filesystem
+          # that supports swap files (e.g. /tmp won't work)
+          swap=$RUNNER_TEMP/swapfile
+          echo "Creating $SIZE MB swap file ..."
+          run_cmd dd if=/dev/zero of=$swap bs=1M count=$SIZE
+          run_cmd mkswap $swap
+          echo ' '
+          echo 'Activating new swap file:'
+          run_cmd swapon $swap
+          run_cmd swapon --show
+          echo ' '
+          echo 'AFTER:'
+          run_cmd free -mt
 
       - name: Update APT config
         run: |
