@@ -132,10 +132,9 @@ jobs:
           case "$ARG_SOURCE" in
             $MAIN_UBUNTU_MIRROR/*/*.dsc) ;;
             $DEBIAN_MIRROR/*/*.dsc) ;;
+            https://bitbucket.org/xtradeb/*.git) ;;
             https://deb.debian.org/debian/*/*.dsc) ;;
             https://incoming.debian.org/debian-buildd/*/*.dsc) ;;
-            https://mirrors.wikimedia.org/debian/*/*.dsc) ;;
-            https://mirrors.wikimedia.org/ubuntu/*/*.dsc) ;;
             https://launchpad.net/*/*.dsc) ;;
             https://ppa.launchpadcontent.net/*/*.dsc) ;;
             https://salsa.debian.org/*/-/jobs/*/artifacts/raw/debian/output/*.dsc) ;;
@@ -192,8 +191,15 @@ jobs:
             dch=/tmp/git-changelog.txt
             for branch in debian/latest main
             do
-              # GitLab URL format
-              changelog_url=${ARG_SOURCE%.git}/-/raw/$branch/debian/changelog
+              case "$ARG_SOURCE" in
+                https://bitbucket.org/*)
+                changelog_url=${ARG_SOURCE%.git}/raw/$branch/debian/changelog
+                ;;
+                https://salsa.debian.org/*)
+                # GitLab URL format
+                changelog_url=${ARG_SOURCE%.git}/-/raw/$branch/debian/changelog
+                ;;
+              esac
               wget -nv -O $dch $changelog_url && break || true
             done
             test -f $dch
