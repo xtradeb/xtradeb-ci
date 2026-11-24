@@ -9,6 +9,19 @@ set -eu
 top_dir=$(cd $(dirname $0) && cd .. && pwd)
 . $top_dir/misc/functions.sh
 
+setup=false
+uc_tag=
+
+for arg in "$@"
+do
+	case "$arg" in
+		--rev=*) uc_tag=${arg#*=} ;;
+		--setup) setup=true ;;
+		-*) error "Unrecognized option \"$arg\"" ;;
+		*)  error "Invalid argument \"$arg\"" ;;
+	esac
+done
+
 base_dir=$PWD
 xtradeb_ci_commit=$(get_git_commit_id $top_dir)
 
@@ -36,7 +49,7 @@ Upstream version: $orig_version
 
 END
 
-if [ "_${1:-}" = _--setup ]
+if $setup
 then
 	test $(id -u) -eq 0 \
 	|| error 'The --setup action must run as root'
@@ -70,12 +83,21 @@ section 'Get ungoogled-chromium Git tree'
 ##
 
 test -d ungoogled-chromium \
-|| run_cmd git clone --depth=10 https://github.com/ungoogled-software/ungoogled-chromium.git
+|| run_cmd git clone --depth=50 https://github.com/ungoogled-software/ungoogled-chromium.git
 
-uc_tag=$(git -C ungoogled-chromium tag --list --sort=version:refname "$orig_version-*" | tail -n1)
-test -n "$uc_tag" || error "Cannot find matching tag for $orig_version"
+if [ -n "$uc_tag" ]
+then
+	git -C ungoogled-chromium show "$uc_tag" -- >/dev/null
+	check_git=
+else
+	uc_tag=$(git -C ungoogled-chromium tag --list --sort=version:refname "$orig_version-*" | tail -n1)
+	test -n "$uc_tag" || error "Cannot find matching tag for $orig_version"
+	check_git=check-git
+fi
 
-uc_rev=${uc_tag##*-}
+uc_subtag=${uc_tag##*-}
+test "_$uc_subtag" != "_$uc_tag" \
+|| uc_subtag=$(cat ungoogled-chromium/revision.txt)
 
 echo ' '
 
@@ -112,14 +134,14 @@ mkdir  inner-work
 SECURE_WRAP_RW_DIRS=$base_dir/inner-work
 
 (cd inner-work && secure_wrap make -f ../ungoogled-chromium-debian/convert/Makefile \
-	check-git source-package \
+	$check_git source-package \
 	VERSION=$orig_version \
 	ORIG_SOURCE=../source/$chromium_dir \
 	ORIG_TARBALL=../source/$orig_tar_file \
 	INIT_PRE_GEN=1 \
 	UNGOOGLED=../ungoogled-chromium \
 	DEBIAN_CONVERT=../ungoogled-chromium-debian/convert \
-	ADD_VERSION_SUFFIX=.$uc_rev \
+	ADD_VERSION_SUFFIX=.$uc_subtag \
 	DISTRIBUTION=
 )
 

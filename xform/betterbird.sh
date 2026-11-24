@@ -7,6 +7,17 @@ set -eu
 top_dir=$(cd $(dirname $0) && cd .. && pwd)
 . $top_dir/misc/functions.sh
 
+bb_tag=
+
+for arg in "$@"
+do
+	case "$arg" in
+		--rev=*) bb_tag=${arg#*=} ;;
+		-*) error "Unrecognized option \"$arg\"" ;;
+		*)  error "Invalid argument \"$arg\"" ;;
+	esac
+done
+
 base_dir=$PWD
 xtradeb_ci_commit=$(get_git_commit_id $top_dir)
 
@@ -47,10 +58,18 @@ section 'Get thunderbird-patches Git tree'
 test -d thunderbird-patches \
 || run_cmd git clone --depth=50 https://github.com/Betterbird/thunderbird-patches.git
 
-bb_tag=$(git -C thunderbird-patches tag --list --sort=version:refname "$orig_version-bb*" | tail -n1)
-test -n "$bb_tag" || error "Cannot find matching tag for $orig_version"
+if [ -n "$bb_tag" ]
+then
+	git -C thunderbird-patches show "$bb_tag" -- >/dev/null
+	check='check-apply check-patch-drop-list'
+else
+	bb_tag=$(git -C thunderbird-patches tag --list --sort=version:refname "$orig_version-bb*" | tail -n1)
+	test -n "$bb_tag" || error "Cannot find matching tag for $orig_version"
+	check=check
+fi
 
-bb_rev=${bb_tag#*-}
+bb_subtag=${bb_tag#*-}
+test "_$bb_subtag" != "_$bb_tag" || bb_subtag=0
 
 echo ' '
 
@@ -87,11 +106,11 @@ ln -sr source/$orig_tar_l10n_file inner-work/
 SECURE_WRAP_RW_DIRS=$base_dir/inner-work
 
 (cd inner-work && secure_wrap make -f ../betterbird-debian/Makefile \
-	check source-package \
+	$check source-package \
 	THUNDERBIRD_SOURCE=../source/$thunderbird_dir \
 	THUNDERBIRD_PATCHES=../thunderbird-patches \
 	DEBIAN_CONVERT=../betterbird-debian \
-	ADD_VERSION_SUFFIX=.$bb_rev \
+	ADD_VERSION_SUFFIX=.$bb_subtag \
 	DISTRIBUTION=
 )
 

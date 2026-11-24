@@ -10,6 +10,8 @@ on:
         type: string
       source-archive:
         type: string
+      project-rev:
+        type: string
   workflow_dispatch:
     inputs:
       package:
@@ -35,6 +37,9 @@ on:
           - ubuntu-devel
         required: true
         description: Download base package from
+      project-rev:
+        type: string
+        description: Git revision in project repo
 
 run-name: "${{inputs.package}} \U00002190 ${{inputs.version}}"
 
@@ -54,6 +59,7 @@ jobs:
       ARG_PACKAGE: ${{inputs.package}}
       ARG_VERSION: ${{inputs.version}}
       ARG_SOURCE_ARCHIVE: ${{inputs.source-archive}}
+      ARG_PROJECT_REV: ${{inputs.project-rev}}
     steps:
 
       - name: Clone Git repository
@@ -69,7 +75,8 @@ jobs:
             -e 'sub chk($$$) { ($v, $r, $w) = @_; $ENV{$v} =~ /^($r)$/ and print "$v: OK\n" or die "error: invalid $w\n"; }' \
             -e 'chk("ARG_PACKAGE", qr/\w[-.\w]{,64}/, "package");' \
             -e 'chk("ARG_VERSION", qr/(\d{1,2}:)?\w[-.+~\w]{,128}/, "version");' \
-            -e 'chk("ARG_SOURCE_ARCHIVE", qr/debian-(incoming|(un)?stable)|ubuntu-devel/, "source archive");'
+            -e 'chk("ARG_SOURCE_ARCHIVE", qr/debian-(incoming|(un)?stable)|ubuntu-devel/, "source archive");' \
+            -e 'chk("ARG_PROJECT_REV", qr/(\w[-.+~\w]{,128})?/, "project rev");'
           if [ ! -f "xform/$ARG_PACKAGE.sh" ]
           then
             echo "error: unrecognized package \"$ARG_PACKAGE\""
@@ -189,7 +196,8 @@ jobs:
         run: |
           exec 2>&1; set -x
           cd work
-          ../xform/$ARG_PACKAGE.sh
+          ../xform/$ARG_PACKAGE.sh \
+            ${ARG_PROJECT_REV:+--rev=$ARG_PROJECT_REV}
 
       # This cannot be passed directly via .with.args of the next step
       - name: Prepare container script
@@ -237,7 +245,7 @@ jobs:
           cd work
           DEBEMAIL='root@example.org' run_cmd ../xform/$ARG_PACKAGE.sh --setup
           RUN_AS_USER_NO_RESET_ENV=t \
-            run_as_user ../xform/$ARG_PACKAGE.sh
+            run_as_user "../xform/$ARG_PACKAGE.sh ${ARG_PROJECT_REV:+--rev=$ARG_PROJECT_REV}"
 
       - name: Perform transformation (inside container)
         if: steps.info.outputs.requires-system-setup
