@@ -307,21 +307,36 @@ jobs:
         id: mirror
         run: |
           mirror=$MAIN_UBUNTU_MIRROR
-          grep -Fq $mirror /etc/apt/apt-mirrors.txt || { echo assert failed; exit 1; }
-          mkdir /tmp/mirror-check; cd /tmp/mirror-check
-          if (set -x; timeout -v 5s apt-get download hedgewars-data)
+          mirrors_file=/etc/apt/apt-mirrors.txt
+          use_alt=false
+          if grep -Fq $mirror $mirrors_file
           then
-            # Should download at ~80 MB/sec
-            echo 'Azure Ubuntu mirror server seems OK.'
+            mkdir /tmp/mirror-check; cd /tmp/mirror-check
+            if (set -x; timeout -v 5s apt-get download hedgewars-data)
+            then
+              # Should download at ~80 MB/sec
+              echo 'Azure Ubuntu mirror server seems OK.'
+            else
+              # *groan* https://github.com/actions/runner-images/issues/7048
+              (set -x; ls -l)
+              use_alt=true
+            fi
+            cd ..; rm -r mirror-check
           else
-            # *groan* https://github.com/actions/runner-images/issues/7048
-            (set -x; ls -l)
+            # GitHub sometimes substitutes an Amazon EC2 mirror of Ubuntu
+            # for the Azure one. It is dog slow; do not use it.
+            echo "Note: Azure Ubuntu mirror is not in $mirrors_file:"
+            cat $mirrors_file
+            echo ' '
+            use_alt=true
+          fi
+          if $use_alt
+          then
             echo 'Using alternate Ubuntu mirror server.'
             mirror=$ALT_UBUNTU_MIRROR
             sudo sed -ri "s!^(URIs): .*!\\1: $mirror!" /etc/apt/sources.list.d/ubuntu.sources
-            sudo rm /etc/apt/apt-mirrors.txt
+            sudo rm $mirrors_file
           fi
-          cd ..; rm -r mirror-check
           echo ubuntu-mirror=$mirror >> $GITHUB_OUTPUT
 
       - name: Install required packages
