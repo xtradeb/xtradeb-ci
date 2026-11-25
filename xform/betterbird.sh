@@ -68,7 +68,7 @@ else
 	check=check
 fi
 
-bb_subtag=${bb_tag#*-}
+bb_subtag=$(sed -r 's/[^-]+-//; s/^(bb[0-9]+)-(p[0-9]+)/\1\2/; s/-/+/g' <<< $bb_tag)
 test "_$bb_subtag" != "_$bb_tag" || bb_subtag=0
 
 echo ' '
